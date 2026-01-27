@@ -37,7 +37,7 @@ _CREATE_WORK_BATCH = text("""
     SELECT 
         gen_random_uuid(),
         :work_type,
-        unnest(:chunk_keys),
+        unnest(CAST(:chunk_keys AS text[])),
         :params,
         :priority,
         :created_at,

@@ -632,6 +632,13 @@ class BaseValidatorNeuron(BaseNeuron):
 
                     bt.logging.debug({"validator_loop": {"phase": "sync_start"}})
                     self.sync()
+                    # Sync miners to database after metagraph sync
+                    try:
+                        self.loop.run_until_complete(
+                            self.handlers.sync_metagraph_handler.run_async(self, set_weights=False)
+                        )
+                    except Exception as e:
+                        bt.logging.warning({"miner_db_sync_error": str(e)})
                     bt.logging.debug({"validator_loop": {"phase": "sync_complete"}})
 
                     self.step += 1
