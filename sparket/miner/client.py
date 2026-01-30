@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import bittensor as bt
 
@@ -14,7 +15,13 @@ class ValidatorClient:
     Supports:
     - Pushing odds/outcome submissions to validators
     - Pulling game data (events/markets) from validators with delta sync
+    - Automatic backoff when validators are not ready
     """
+    
+    # Backoff settings
+    INITIAL_BACKOFF_SEC = 5.0
+    MAX_BACKOFF_SEC = 60.0
+    BACKOFF_MULTIPLIER = 2.0
     
     def __init__(
         self,
@@ -27,6 +34,10 @@ class ValidatorClient:
         self._metagraph = metagraph
         self._get_endpoint = get_validator_endpoint
         self._dendrite = bt.Dendrite(wallet=wallet)
+        
+        # Backoff state: track when to retry after "not_ready"
+        self._backoff_until: float = 0.0
+        self._current_backoff: float = self.INITIAL_BACKOFF_SEC
 
     def _select_validator_axons(self) -> List[Any]:
         """Select validator axons to communicate with.
@@ -48,13 +59,42 @@ class ValidatorClient:
         except Exception:
             return []
 
-    def _check_response_errors(self, responses: Any, operation: str) -> bool:
+    def _is_in_backoff(self) -> bool:
+        """Check if we're currently in backoff period."""
+        return time.time() < self._backoff_until
+    
+    def _trigger_backoff(self) -> None:
+        """Trigger exponential backoff after receiving not_ready."""
+        self._backoff_until = time.time() + self._current_backoff
+        bt.logging.info({
+            "validator_backoff": {
+                "seconds": self._current_backoff,
+                "until": datetime.fromtimestamp(self._backoff_until).isoformat(),
+            }
+        })
+        # Increase backoff for next time (exponential)
+        self._current_backoff = min(
+            self._current_backoff * self.BACKOFF_MULTIPLIER,
+            self.MAX_BACKOFF_SEC
+        )
+    
+    def _reset_backoff(self) -> None:
+        """Reset backoff after successful communication."""
+        self._current_backoff = self.INITIAL_BACKOFF_SEC
+        self._backoff_until = 0.0
+
+    def _check_response_errors(self, responses: Any, operation: str) -> Tuple[bool, bool]:
         """Check response for errors and log them.
         
-        Returns True if successful, False if there were errors.
+        Returns:
+            Tuple of (success: bool, should_backoff: bool)
+            - success: True if submission was accepted
+            - should_backoff: True if validator returned "not_ready"
         """
         if not responses:
-            return True  # No response to check
+            return True, False  # No response to check
+        
+        should_backoff = False
         
         for i, resp in enumerate(responses if isinstance(responses, list) else [responses]):
             # Extract payload from response
@@ -69,14 +109,25 @@ class ValidatorClient:
             if result.get("success") is False or "error" in result:
                 error_code = result.get("error", "unknown")
                 message = result.get("message", "No details")
-                bt.logging.warning({
-                    f"{operation}_rejected": {
-                        "error": error_code,
-                        "message": message,
-                        "validator_index": i,
-                    }
-                })
-                return False
+                
+                # Check if validator is not ready - trigger backoff
+                if error_code == "not_ready":
+                    bt.logging.info({
+                        f"{operation}_validator_not_ready": {
+                            "message": message,
+                            "will_backoff": True,
+                        }
+                    })
+                    should_backoff = True
+                else:
+                    bt.logging.warning({
+                        f"{operation}_rejected": {
+                            "error": error_code,
+                            "message": message,
+                            "validator_index": i,
+                        }
+                    })
+                return False, should_backoff
             
             # Log if submission was not accepted (but no error)
             if result.get("accepted") is False:
@@ -87,14 +138,25 @@ class ValidatorClient:
                     }
                 })
         
-        return True
+        return True, False
 
     async def submit_odds(self, payload: dict, *, timeout: float = 12.0) -> bool:
         """Submit odds to validators.
         
         Returns True if submission was accepted, False otherwise.
-        Logs any errors received from validators.
+        Respects backoff period if validator was not ready.
         """
+        # Check if we're in backoff period
+        if self._is_in_backoff():
+            remaining = self._backoff_until - time.time()
+            bt.logging.debug({
+                "submit_odds_skipped": {
+                    "reason": "in_backoff",
+                    "remaining_seconds": round(remaining, 1),
+                }
+            })
+            return False
+        
         syn = SparketSynapse(type=SparketSynapseType.ODDS_PUSH, payload=payload)
         axons = self._select_validator_axons()
         if not axons:
@@ -102,7 +164,14 @@ class ValidatorClient:
             return False
         try:
             responses = await self._dendrite.forward(axons=axons, synapse=syn, timeout=timeout)
-            return self._check_response_errors(responses, "submit_odds")
+            success, should_backoff = self._check_response_errors(responses, "submit_odds")
+            
+            if should_backoff:
+                self._trigger_backoff()
+            elif success:
+                self._reset_backoff()
+            
+            return success
         except Exception as e:
             bt.logging.warning({"submit_odds_exception": str(e)})
             return False
@@ -111,8 +180,19 @@ class ValidatorClient:
         """Submit outcome to validators.
         
         Returns True if submission was accepted, False otherwise.
-        Logs any errors received from validators.
+        Respects backoff period if validator was not ready.
         """
+        # Check if we're in backoff period
+        if self._is_in_backoff():
+            remaining = self._backoff_until - time.time()
+            bt.logging.debug({
+                "submit_outcome_skipped": {
+                    "reason": "in_backoff",
+                    "remaining_seconds": round(remaining, 1),
+                }
+            })
+            return False
+        
         syn = SparketSynapse(type=SparketSynapseType.OUTCOME_PUSH, payload=payload)
         axons = self._select_validator_axons()
         if not axons:
@@ -120,7 +200,14 @@ class ValidatorClient:
             return False
         try:
             responses = await self._dendrite.forward(axons=axons, synapse=syn, timeout=timeout)
-            return self._check_response_errors(responses, "submit_outcome")
+            success, should_backoff = self._check_response_errors(responses, "submit_outcome")
+            
+            if should_backoff:
+                self._trigger_backoff()
+            elif success:
+                self._reset_backoff()
+            
+            return success
         except Exception as e:
             bt.logging.warning({"submit_outcome_exception": str(e)})
             return False
@@ -142,6 +229,17 @@ class ValidatorClient:
             Response dict with keys: events, markets, sync_ts
             Or None if request failed.
         """
+        # Check if we're in backoff period
+        if self._is_in_backoff():
+            remaining = self._backoff_until - time.time()
+            bt.logging.debug({
+                "fetch_game_data_skipped": {
+                    "reason": "in_backoff",
+                    "remaining_seconds": round(remaining, 1),
+                }
+            })
+            return None
+        
         payload = {}
         if since_ts is not None:
             payload["since_ts"] = since_ts.isoformat()
@@ -177,10 +275,23 @@ class ValidatorClient:
                     })
                     return None
                 
-                # Check for errors
-                if "error" in result:
-                    bt.logging.warning({"fetch_game_data_error": result.get("error")})
+                # Check for not_ready error - trigger backoff
+                error_code = result.get("error")
+                if error_code == "not_ready":
+                    bt.logging.info({
+                        "fetch_game_data_validator_not_ready": {
+                            "message": result.get("message", ""),
+                            "will_backoff": True,
+                        }
+                    })
+                    self._trigger_backoff()
                     return None
+                elif error_code:
+                    bt.logging.warning({"fetch_game_data_error": error_code})
+                    return None
+                
+                # Success - reset backoff
+                self._reset_backoff()
                 
                 # Response format: games (with embedded markets), retrieved_at
                 games = result.get("games", [])

@@ -193,6 +193,18 @@ async def cleanup_stale_workers(
                 params={"job_id": current_job},
             )
             logger.info(f"Reset stuck job: {current_job}")
+        
+        # Delete the stale worker entry from heartbeat table
+        await db.write(
+            text(
+                """
+                DELETE FROM scoring_worker_heartbeat
+                WHERE worker_id = :worker_id
+                """
+            ),
+            params={"worker_id": worker_id},
+        )
+        logger.info(f"Removed stale worker entry: {worker_id}")
 
 
 async def reset_stuck_jobs(db: Any, *, threshold_hours: int = 2) -> None:

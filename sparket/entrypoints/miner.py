@@ -155,6 +155,13 @@ class Miner(BaseMinerNeuron):
         
         super(Miner, self).__init__(config=config)
 
+        # Prevent double-logging from bittensor's standard Python logger
+        # (bittensor has its own console handler, so we disable propagation
+        # to prevent the root logger from also printing the same messages)
+        import logging as std_logging
+        bt_logger = std_logging.getLogger("bittensor")
+        bt_logger.propagate = False
+
         self._validator_cache: dict[str, dict[str, object]] = {}
         # Primary validator endpoint (set when CONNECTION_INFO_PUSH received)
         self.validator_endpoint: Optional[dict[str, object]] = None

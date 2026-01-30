@@ -108,21 +108,23 @@ class ScoringWorkerRunner:
         signal.signal(signal.SIGINT, self._handle_signal)
 
         try:
-            # Create independent database connection
-            self._init_database()
-
-            # Record startup memory baseline
-            self._startup_memory_mb = self._get_memory_mb()
-            logger.info(f"Startup memory: {self._startup_memory_mb} MB")
-
-            # Run startup tasks
-            asyncio.run(self._startup_tasks())
-
-            # Main loop
+            # Create a single event loop for the entire worker lifecycle
+            # This prevents "Future attached to a different loop" errors
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
             try:
+                # Create independent database connection
+                self._init_database()
+
+                # Record startup memory baseline
+                self._startup_memory_mb = self._get_memory_mb()
+                logger.info(f"Startup memory: {self._startup_memory_mb} MB")
+
+                # Run startup tasks in the same loop
+                loop.run_until_complete(self._startup_tasks())
+
+                # Main loop
                 loop.run_until_complete(self._main_loop())
             finally:
                 loop.run_until_complete(self._cleanup())

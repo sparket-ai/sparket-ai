@@ -33,9 +33,9 @@ from sparket.devtools.mock_bittensor import MockDendrite
 from sparket.base.config import add_validator_args
 from sparket.validator.config.config import Config as ValidatorAppConfig
 from sparket.config import sanitize_dict
-from sparket.protocol.protocol import SparketSynapse
+from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
+from sparket.validator.comms import ValidatorComms
 from sparket.validator.handlers.handlers import Handlers
-from sparket.validator.handlers.ingest.provider_scheduler import run_provider_ingest_if_due
 from sparket.validator.services import SportsDataIngestor
 from sparket.validator.utils.runtime import concurrent_forward, next_backoff_delay, resolve_loop_timeouts
 from sparket.validator.utils.startup import (
@@ -44,6 +44,7 @@ from sparket.validator.utils.startup import (
     summarize_bittensor_state,
 )
 from sparket.validator.listeners.synapse_listener import route_incoming_synapse
+from sparket.shared.log_colors import LogColors
 
 
 class BaseValidatorNeuron(BaseNeuron):
@@ -106,6 +107,10 @@ class BaseValidatorNeuron(BaseNeuron):
 
         # SportsDataIO ingestor (initialized during component setup)
         self.sdio_ingestor: SportsDataIngestor | None = None
+        
+        # Background SDIO ingest task management
+        self._sdio_ingest_running: bool = False
+        self._sdio_ingest_task: asyncio.Task | None = None
 
         # Initialize validator components (database, etc.)
         self.initialize_components()
@@ -148,6 +153,21 @@ class BaseValidatorNeuron(BaseNeuron):
         except Exception as e:
             bt.logging.warning({"validator_context": {"worker_shutdown_error": str(e)}})
 
+        # Stop SDIO background ingest task
+        try:
+            self._sdio_ingest_running = False
+            task = getattr(self, "_sdio_ingest_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    loop = getattr(self, "loop", None)
+                    if loop and not loop.is_closed():
+                        loop.run_until_complete(task)
+                except asyncio.CancelledError:
+                    pass
+        except Exception as e:
+            bt.logging.warning({"validator_context": {"sdio_task_cancel_error": str(e)}})
+
         try:
             ingestor = getattr(self, "sdio_ingestor", None)
             loop = getattr(self, "loop", None)
@@ -172,6 +192,10 @@ class BaseValidatorNeuron(BaseNeuron):
         Local imports avoid circular dependencies and heavy import cost when unused.
         """
         try:
+            # Configure logging FIRST (suppress noise, add colored labels, prevent double-logging)
+            from sparket.validator.utils.logging_config import configure_validator_logging
+            configure_validator_logging()
+            
             bt.logging.info({"validator_init": {"step": "importing_modules"}})
             from sparket.validator.database.init import initialize as init_db
             from sparket.validator.database.dbm import DBM
@@ -218,16 +242,6 @@ class BaseValidatorNeuron(BaseNeuron):
 
             # Initialize database
             bt.logging.info({"validator_init": {"step": "initializing_database"}})
-            
-            # Suppress verbose SQLAlchemy logging (TRACE floods logs with SQL statements)
-            import logging as std_logging
-            for sqla_logger_name in ["sqlalchemy", "sqlalchemy.engine", "sqlalchemy.pool", "sqlalchemy.engine.Engine"]:
-                sqla_logger = std_logging.getLogger(sqla_logger_name)
-                sqla_logger.setLevel(std_logging.CRITICAL)
-                sqla_logger.disabled = True
-                sqla_logger.handlers = []
-                sqla_logger.propagate = False
-            
             init_db(self.app_config)
             bt.logging.info({"validator_init": {"step": "database_initialized"}})
             
@@ -241,6 +255,9 @@ class BaseValidatorNeuron(BaseNeuron):
                 # Initialize from DB to avoid re-fetching on restart
                 restored = self.loop.run_until_complete(self.sdio_ingestor.initialize_from_db())
                 bt.logging.info({"validator_init": {"step": "sdio_ingestor_restored_from_db", "events": restored}})
+                # Start background ingest task (runs independently of main loop)
+                self._start_sdio_ingest_background()
+                bt.logging.info({"validator_init": {"step": "sdio_background_ingest_started"}})
             except Exception as e:
                 self.sdio_ingestor = None
                 bt.logging.warning({"validator_init": {"sdio_ingestor_init_error": str(e)}})
@@ -267,6 +284,46 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.info({"validator_init": {"step": "initializing_handlers"}})
             self.handlers = Handlers(self.dbm)
             bt.logging.info({"validator_init": {"step": "handlers_initialized"}})
+
+            # Initialize ValidatorComms for token management
+            bt.logging.info({"validator_init": {"step": "initializing_comms"}})
+            proxy_url = getattr(getattr(self.app_config, "validator", None), "proxy_url", None)
+            require_token = bool(getattr(getattr(self.app_config, "validator", None), "require_push_token", True))
+            step_rotation = int(getattr(getattr(self.app_config, "validator", None), "token_rotation_steps", 10))
+            self.comms = ValidatorComms(
+                proxy_url=proxy_url,
+                require_token=require_token,
+                step_rotation=step_rotation,
+            )
+            bt.logging.info({
+                "validator_init": {
+                    "step": "comms_initialized",
+                    "require_token": require_token,
+                    "step_rotation": step_rotation,
+                }
+            })
+
+            # Track last connection push time
+            self._last_connection_push = 0.0
+
+            # Initialize SecurityManager for rate limiting and blacklisting
+            bt.logging.info({"validator_init": {"step": "initializing_security_manager"}})
+            try:
+                from sparket.validator.security import SecurityManager
+                self.security_manager = SecurityManager(database=self.dbm)
+                # Load permanent blacklist from database
+                self.loop.run_until_complete(self.security_manager.load_blacklist_from_db())
+                # Initialize with current metagraph hotkeys
+                self.security_manager.update_registered_hotkeys(self.metagraph)
+                bt.logging.info({
+                    "validator_init": {
+                        "step": "security_manager_initialized",
+                        "stats": self.security_manager.get_stats(),
+                    }
+                })
+            except Exception as e:
+                bt.logging.warning({"validator_init": {"security_manager_error": str(e)}})
+                self.security_manager = None
 
             # Start scoring worker if enabled
             self.scoring_worker_manager = None
@@ -344,35 +401,30 @@ class BaseValidatorNeuron(BaseNeuron):
             except Exception as e:
                 bt.logging.warning({"axon_external_ip_error": str(e)})
 
+            # Inject security middleware for early request rejection
+            # Must happen AFTER axon creation but BEFORE attach/start
+            if hasattr(self, "security_manager") and self.security_manager is not None:
+                try:
+                    from sparket.validator.security import inject_security_middleware
+                    inject_security_middleware(self.axon, self.security_manager)
+                except Exception as e:
+                    bt.logging.warning({"security_middleware_injection_error": str(e)})
+
             async def _forward(synapse: SparketSynapse) -> SparketSynapse:
                 try:
-                    try:
-                        payload = synapse.payload if hasattr(synapse, "payload") else None
-                        syn_type = getattr(synapse, "type", None)
-                        # Handle both enum and string types
-                        if hasattr(syn_type, "value"):
-                            type_val = syn_type.value
-                        else:
-                            type_val = syn_type  # Already a string
-                        bt.logging.debug({
-                            "axon_forward_received": {
-                                "synapse_class": synapse.__class__.__name__,
-                                "sparket_type": type_val,
-                                "payload_type": type(payload).__name__ if payload is not None else None,
-                            }
-                        })
-                    except Exception:
-                        pass
-                    # Route asynchronously; forward must return the synapse
-                    await route_incoming_synapse(self, synapse)  # type: ignore[arg-type]
+                    # Minimal logging to reduce overhead during high traffic
+                    syn_type = getattr(synapse, "type", None)
+                    type_val = syn_type.value if hasattr(syn_type, "value") else syn_type
                     
-                    # Debug: log synapse payload after routing
+                    # Only log at TRACE level to avoid flooding during high traffic
                     bt.logging.trace({
-                        "forward_after_route": {
-                            "payload_type": type(synapse.payload).__name__,
-                            "payload_keys": list(synapse.payload.keys()) if isinstance(synapse.payload, dict) else None,
+                        "axon_forward": {
+                            "type": type_val,
                         }
                     })
+                    
+                    # Route asynchronously; forward must return the synapse
+                    await route_incoming_synapse(self, synapse)  # type: ignore[arg-type]
                 except Exception as e:
                     bt.logging.warning({"forward_route_error": str(e)})
                 return synapse
@@ -439,9 +491,236 @@ class BaseValidatorNeuron(BaseNeuron):
         except Exception as e:
             bt.logging.warning({"validator_serve_axon_error": str(e)})
 
+    async def forward(self) -> None:
+        """Push connection info (including auth token) to miners periodically.
+        
+        This implements the abstract forward method from BaseNeuron.
+        Miners use this information to submit odds/outcomes back to the validator.
+        """
+        import time as _time
+        
+        # Check if enough time has passed since last push
+        now = _time.time()
+        interval = getattr(self, "connection_push_interval", 300)
+        last_push = getattr(self, "_last_connection_push", 0.0)
+        
+        if now - last_push < interval:
+            return
+        
+        # Ensure comms is initialized
+        if not hasattr(self, "comms") or self.comms is None:
+            bt.logging.debug({"forward": "comms_not_ready"})
+            return
+        
+        # Ensure axon is available
+        if not hasattr(self, "axon") or self.axon is None:
+            bt.logging.debug({"forward": "axon_not_ready"})
+            return
+        
+        try:
+            # Build endpoint info
+            endpoint = self.comms.advertised_endpoint(axon=self.axon)
+            
+            # Get current token
+            step = int(self.step) if hasattr(self.step, '__int__') else 0
+            token = self.comms.current_token(step=step)
+            
+            # Build payload
+            payload = {
+                **endpoint,
+                "token": token,
+                "hotkey": self.wallet.hotkey.ss58_address,
+                "step": step,
+            }
+            
+            # Create synapse
+            synapse = SparketSynapse(
+                type=SparketSynapseType.CONNECTION_INFO_PUSH,
+                payload=payload,
+            )
+            
+            # Get miner axons (exclude self, filter active)
+            try:
+                axons = [
+                    ax for i, ax in enumerate(self.metagraph.axons)
+                    if getattr(ax, "port", 0) > 0
+                    and self.metagraph.hotkeys[i] != self.wallet.hotkey.ss58_address
+                ]
+            except Exception:
+                axons = []
+            
+            if not axons:
+                bt.logging.debug({"forward": "no_miner_axons"})
+                return
+            
+            # Push to miners using dendrite
+            dendrite = getattr(self, "dendrite", None)
+            if dendrite is None:
+                dendrite = bt.Dendrite(wallet=self.wallet)
+                self.dendrite = dendrite
+            
+            responses = await dendrite.forward(
+                axons=axons,
+                synapse=synapse,
+                timeout=12.0,
+            )
+            
+            # Categorize responses for detailed summary
+            success_count = 0
+            timeout_count = 0
+            error_count = 0
+            unreachable_count = 0
+            
+            for i, resp in enumerate(responses or []):
+                # Get status info from response
+                dendrite_info = getattr(resp, "dendrite", None)
+                status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
+                status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
+                
+                if status_code is None or status_code == 0:
+                    # No response / connection failed
+                    unreachable_count += 1
+                elif status_code == 408 or "timeout" in status_msg.lower():
+                    # Timeout
+                    timeout_count += 1
+                elif status_code >= 400:
+                    # Other error (4xx/5xx)
+                    error_count += 1
+                else:
+                    # Success (2xx/3xx)
+                    success_count += 1
+            
+            self._last_connection_push = now
+            
+            # Log detailed summary
+            total = len(axons)
+            success_pct = (success_count / total * 100) if total > 0 else 0
+            bt.logging.info(
+                f"{LogColors.NETWORK_LABEL} connection_broadcast: "
+                f"total={total}, success={success_count} ({success_pct:.0f}%), "
+                f"timeout={timeout_count}, error={error_count}, unreachable={unreachable_count}"
+            )
+            
+        except Exception as e:
+            bt.logging.warning({"connection_push_error": str(e)})
+
+    # -------------------------------------------------------------------------
+    # Background SDIO Ingest
+    # -------------------------------------------------------------------------
     
-
-
+    def _start_sdio_ingest_background(self) -> None:
+        """Start the SDIO ingest as a background task.
+        
+        Runs independently of the main loop to avoid blocking.
+        Uses its own cadence and error handling.
+        """
+        if self.sdio_ingestor is None:
+            bt.logging.warning({"sdio_background": "ingestor_not_available"})
+            return
+        
+        if self._sdio_ingest_running:
+            bt.logging.debug({"sdio_background": "already_running"})
+            return
+        
+        self._sdio_ingest_running = True
+        self._sdio_ingest_task = asyncio.ensure_future(
+            self._sdio_ingest_loop(),
+            loop=self.loop,
+        )
+        bt.logging.info({"sdio_background": "started"})
+    
+    async def _sdio_ingest_loop(self) -> None:
+        """Background loop for SDIO provider ingestion.
+        
+        Runs continuously with configurable interval, independent of the main
+        validator loop. This prevents long ingestion operations from blocking
+        critical path operations like scoring and weight setting.
+        """
+        from datetime import datetime, timezone
+        
+        # Get interval from config (default 60 seconds)
+        interval_seconds = 60
+        try:
+            timers = getattr(getattr(self.app_config, "core", None), "timers", None)
+            if timers is not None:
+                interval_seconds = max(30, int(getattr(timers, "sdio_ingest_interval_seconds", 60)))
+        except Exception:
+            pass
+        
+        bt.logging.info({
+            "sdio_background_loop": {
+                "interval_seconds": interval_seconds,
+                "status": "starting",
+            }
+        })
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        error_backoff = 30  # Additional wait on errors
+        
+        while self._sdio_ingest_running:
+            cycle_start = datetime.now(timezone.utc)
+            try:
+                if self.sdio_ingestor is not None:
+                    await self.sdio_ingestor.run_once(now=cycle_start)
+                    
+                    # Also run provider closing upserts
+                    from sparket.validator.handlers.ingest.provider_ingest import upsert_provider_closing
+                    from sparket.providers.providers import get_provider_id
+                    
+                    provider_id = get_provider_id("SDIO")
+                    if provider_id:
+                        try:
+                            upserts = await upsert_provider_closing(
+                                database=self.dbm,
+                                provider_id=provider_id,
+                                close_ts=cycle_start,
+                            )
+                            if upserts:
+                                bt.logging.debug({"sdio_background_closing_upserts": upserts})
+                        except Exception as exc:
+                            bt.logging.warning({"sdio_background_closing_error": str(exc)})
+                
+                consecutive_errors = 0  # Reset on success
+                
+            except asyncio.CancelledError:
+                bt.logging.info({"sdio_background_loop": "cancelled"})
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                bt.logging.warning({
+                    "sdio_background_error": str(e),
+                    "consecutive_errors": consecutive_errors,
+                })
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    bt.logging.error({
+                        "sdio_background_loop": "too_many_errors",
+                        "stopping": True,
+                    })
+                    break
+                
+                # Extra backoff on error
+                await asyncio.sleep(error_backoff)
+            
+            # Calculate time taken and sleep for remainder of interval
+            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+            sleep_time = max(1, interval_seconds - elapsed)
+            
+            bt.logging.debug({
+                "sdio_background_cycle": {
+                    "elapsed_seconds": round(elapsed, 1),
+                    "sleep_seconds": round(sleep_time, 1),
+                }
+            })
+            
+            try:
+                await asyncio.sleep(sleep_time)
+            except asyncio.CancelledError:
+                break
+        
+        self._sdio_ingest_running = False
+        bt.logging.info({"sdio_background_loop": "stopped"})
 
     def run(self):
         """
@@ -484,12 +763,14 @@ class BaseValidatorNeuron(BaseNeuron):
                     step_target = getattr(timers, "step_target_seconds", 12) if timers is not None else 12
                     timeouts = resolve_loop_timeouts(step_target)
 
+                    # Heartbeat log - always visible even during traffic flood
                     bt.logging.info(
                         {
                             "validator_loop": {
                                 "iteration": loop_iter,
                                 "step": self.step,
                                 "block": self.block,
+                                "heartbeat": True,
                             }
                         }
                     )
@@ -583,21 +864,8 @@ class BaseValidatorNeuron(BaseNeuron):
                         bt.logging.warning({"validator_loop": {"phase": "scoring_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "scoring_complete"}})
 
-                    bt.logging.debug({"validator_loop": {"phase": "provider_ingest_start"}})
-                    try:
-                        self.loop.run_until_complete(
-                            asyncio.wait_for(
-                                run_provider_ingest_if_due(
-                                    validator=self,
-                                    database=self.dbm,
-                                    ingestor=self.sdio_ingestor,
-                                ),
-                                timeout=timeouts["provider"],
-                            )
-                        )
-                    except asyncio.TimeoutError:
-                        bt.logging.warning({"validator_loop": {"phase": "provider_ingest_timeout"}})
-                    bt.logging.debug({"validator_loop": {"phase": "provider_ingest_complete"}})
+                    # NOTE: Provider ingest (SDIO) now runs in background task
+                    # See _sdio_ingest_loop() - started during initialize_components()
 
                     from sparket.validator.handlers.ingest.outcome_processor import run_outcome_processing_if_due
 
@@ -786,7 +1054,9 @@ class BaseValidatorNeuron(BaseNeuron):
                 return
             
             state = np.load(state_path)
-            self.step = state["step"]
+            # Ensure step is an integer, not numpy array
+            loaded_step = state["step"]
+            self.step = int(loaded_step) if hasattr(loaded_step, '__int__') else 0
             
             # Only load file-based scores if we don't have DB scores
             if np.all(self.scores == 0):

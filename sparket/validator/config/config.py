@@ -22,6 +22,20 @@ class ValidatorSettings(BaseModel):
     scoring_worker_enabled: bool = Field(default=True)
     scoring_worker_count: int = Field(default=1, ge=1)
     scoring_worker_fallback: bool = Field(default=True)
+    # Token authentication for miner push operations
+    require_push_token: bool = Field(
+        default=True,
+        description="Require authentication token for miner odds/outcome pushes"
+    )
+    token_rotation_steps: int = Field(
+        default=10,
+        ge=1,
+        description="Number of validator steps before rotating the push token"
+    )
+    proxy_url: str | None = Field(
+        default=None,
+        description="External URL if validator is behind a reverse proxy"
+    )
 
 
 class Config(BaseSettings):

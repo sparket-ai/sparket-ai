@@ -49,6 +49,10 @@ class SyncMetagraphHandler:
         # Update validator's hotkey cache
         validator.hotkeys = copy.deepcopy(validator.metagraph.hotkeys)
         
+        # Update security manager with new registered hotkeys
+        if hasattr(validator, "security_manager") and validator.security_manager is not None:
+            validator.security_manager.update_registered_hotkeys(validator.metagraph)
+        
         # Detect hotkey changes (deregistrations)
         if old_hotkeys:
             changes = self.miner_mgmt.check_miners_registered(
@@ -90,6 +94,10 @@ class SyncMetagraphHandler:
         
         # Update validator's hotkey cache
         validator.hotkeys = copy.deepcopy(validator.metagraph.hotkeys)
+        
+        # Update security manager with new registered hotkeys
+        if hasattr(validator, "security_manager") and validator.security_manager is not None:
+            validator.security_manager.update_registered_hotkeys(validator.metagraph)
         
         # Sync metagraph to database (handles deregistrations)
         try:

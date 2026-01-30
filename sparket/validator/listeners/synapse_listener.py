@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import bittensor as bt
 
 from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
 from sparket.validator.utils.ratelimit import get_rate_limiter
+from sparket.shared.log_colors import LogColors
 
 
 def _set_error_response(synapse: SparketSynapse, error_code: str, message: str) -> None:
@@ -15,6 +16,25 @@ def _set_error_response(synapse: SparketSynapse, error_code: str, message: str) 
         "error": error_code,
         "message": message,
     }
+
+
+def _get_miner_ip(synapse: SparketSynapse) -> Optional[str]:
+    """Extract miner IP from synapse dendrite info."""
+    dendrite = getattr(synapse, "dendrite", None)
+    if dendrite is None:
+        return None
+    return getattr(dendrite, "ip", None)
+
+
+async def _record_failure(validator: Any, hotkey: str, ip: Optional[str], failure_type: str) -> None:
+    """Record a failure in the security manager if available."""
+    security_manager = getattr(validator, "security_manager", None)
+    if security_manager is None:
+        return
+    try:
+        await security_manager.record_failure(hotkey, ip, failure_type)
+    except Exception as e:
+        bt.logging.debug({"security_manager_record_failure_error": str(e)})
 
 
 async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
@@ -31,18 +51,25 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
     Expects `validator` to have: .comms, .handlers, .step
     """
     try:
-        # Extract hotkey for rate limiting and logging
+        # Guard: handlers must be initialized before we can process synapses
+        if not hasattr(validator, "handlers") or validator.handlers is None:
+            _set_error_response(synapse, "not_ready", "Validator still initializing, try again shortly")
+            return None
+        
+        # Extract hotkey and IP for rate limiting and logging
         miner_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None) or "unknown"
+        miner_ip = _get_miner_ip(synapse)
         
         # SECURITY: Rate limiting - first line of defense against DDoS
         rate_limiter = get_rate_limiter()
         allowed, reason = rate_limiter.check_and_record(miner_hotkey)
         if not allowed:
-            bt.logging.warning({
-                "synapse_listener": "rate_limited",
-                "reason": reason,
-                "hotkey": miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey,
-            })
+            hotkey_short = miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey
+            bt.logging.warning(
+                f"{LogColors.MINER_LABEL} rate_limited: hotkey={hotkey_short}, reason={reason}"
+            )
+            # Record failure for cooldown tracking
+            await _record_failure(validator, miner_hotkey, miner_ip, "rate_limited")
             _set_error_response(synapse, "rate_limited", f"Rate limited: {reason}")
             return None
         
@@ -66,17 +93,21 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
         )
         
         if requires_token and comms is not None and getattr(comms, "require_token", False):
-            if not comms.verify_token(token=token, step=validator.step):
-                current_epoch = validator.step // comms.step_rotation
-                bt.logging.warning({
-                    "synapse_listener": "token_invalid",
-                    "miner_hotkey": miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey,
-                    "token_provided": bool(token),
-                    "token_preview": token[:8] + "..." if token else None,
-                    "validator_step": validator.step,
-                    "current_epoch": current_epoch,
-                    "accepted_epochs": [current_epoch, max(0, current_epoch - 1)],
-                })
+            # Ensure step is an integer (could be numpy array from state loading)
+            step_val = validator.step
+            step_int = int(step_val) if hasattr(step_val, '__int__') else 0
+            
+            if not comms.verify_token(token=token, step=step_int):
+                current_epoch = step_int // comms.step_rotation
+                hotkey_short = miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey
+                token_preview = token[:8] + "..." if token else "none"
+                bt.logging.warning(
+                    f"{LogColors.MINER_LABEL} token_invalid: hotkey={hotkey_short}, "
+                    f"token={token_preview}, step={step_int}, epoch={current_epoch}"
+                )
+                # Record failure for cooldown tracking
+                failure_type = "token_missing" if not token else "token_invalid"
+                await _record_failure(validator, miner_hotkey, miner_ip, failure_type)
                 msg = "Token missing" if not token else "Token expired or invalid"
                 _set_error_response(synapse, "token_invalid", msg)
                 return None
@@ -110,9 +141,19 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
             return response
 
         bt.logging.info({"synapse_listener": "ignored", "type": synapse_type})
+        # Record as malformed request
+        await _record_failure(validator, miner_hotkey, miner_ip, "malformed_request")
         _set_error_response(synapse, "unknown_type", f"Unknown synapse type: {synapse_type}")
         return None
     except Exception as e:
-        bt.logging.warning({"synapse_listener_error": str(e)})
+        bt.logging.warning(f"{LogColors.VALIDATOR_LABEL} synapse_listener_error: {e}")
+        # Record as other/generic failure (best-effort, miner_hotkey may not be defined)
+        try:
+            hk = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+            ip = _get_miner_ip(synapse)
+            if hk:
+                await _record_failure(validator, hk, ip, "other")
+        except Exception:
+            pass
         _set_error_response(synapse, "internal_error", str(e))
         return None

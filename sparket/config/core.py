@@ -195,10 +195,12 @@ class TimerSettings(BaseModel):
     step_target_seconds: int = 12
     metagraph_sync_steps: int = 5
     main_score_steps: int = 25
-    # Provider polling
+    # Provider polling (legacy step-based, kept for closing snapshot cadence)
     provider_fetch_steps: int = 50
     provider_hot_window_minutes: int = 60
     provider_hot_fetch_steps: int = 10
+    # SDIO background ingest interval (runs independently of main loop)
+    sdio_ingest_interval_seconds: int = 60
     cleanup_steps: int = 200
     outcome_process_steps: int = 10
 
@@ -209,6 +211,7 @@ class TimerSettings(BaseModel):
         "provider_fetch_steps",
         "provider_hot_window_minutes",
         "provider_hot_fetch_steps",
+        "sdio_ingest_interval_seconds",
         "cleanup_steps",
         "outcome_process_steps",
     )

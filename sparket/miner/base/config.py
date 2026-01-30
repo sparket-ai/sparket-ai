@@ -39,6 +39,7 @@ class BaseMinerConfig:
         SPARKET_BASE_MINER__ENABLED=false
         SPARKET_BASE_MINER__ODDS_API_KEY=xxx
         SPARKET_BASE_MINER__ODDS_REFRESH_SECONDS=900
+        SPARKET_BASE_MINER__BATCH_SIZE=50
     """
     
     # Master switch (enabled by default)
@@ -54,6 +55,9 @@ class BaseMinerConfig:
     
     # Cache TTLs
     cache_ttl_seconds: int = 3600        # 1 hour
+    
+    # Batching - number of markets to batch per submission request
+    batch_size: int = 50                 # Markets per batch (1-200)
     
     # Model parameters
     market_blend_weight: float = 0.60    # Trust market 60%
@@ -103,6 +107,10 @@ class BaseMinerConfig:
         def get_str(key: str, default: Optional[str] = None) -> Optional[str]:
             return os.getenv(f"SPARKET_BASE_MINER__{key}", default)
         
+        # Validate and clamp batch_size to 1-200 range
+        batch_size = get_int("BATCH_SIZE", 50)
+        batch_size = max(1, min(200, batch_size))
+        
         return cls(
             enabled=get_bool("ENABLED", True),
             odds_api_key=get_str("ODDS_API_KEY"),
@@ -110,6 +118,7 @@ class BaseMinerConfig:
             outcome_check_seconds=get_int("OUTCOME_CHECK_SECONDS", 300),
             stats_refresh_seconds=get_int("STATS_REFRESH_SECONDS", 3600),
             cache_ttl_seconds=get_int("CACHE_TTL_SECONDS", 3600),
+            batch_size=batch_size,
             market_blend_weight=get_float("MARKET_BLEND_WEIGHT", 0.60),
             vig=get_float("VIG", 0.045),
         )
