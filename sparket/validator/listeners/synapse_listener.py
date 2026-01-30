@@ -8,6 +8,15 @@ from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
 from sparket.validator.utils.ratelimit import get_rate_limiter
 
 
+def _set_error_response(synapse: SparketSynapse, error_code: str, message: str) -> None:
+    """Set error response in synapse payload for miner feedback."""
+    synapse.payload = {
+        "success": False,
+        "error": error_code,
+        "message": message,
+    }
+
+
 async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
     """
     Rate limit, verify token (if required), and route incoming synapse to handler.
@@ -18,6 +27,7 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
     3. Handler-level validation (market/event checks, bounds)
     
     Returns the emitted event or response data.
+    Sets synapse.payload with error details on failure for miner feedback.
     Expects `validator` to have: .comms, .handlers, .step
     """
     try:
@@ -33,6 +43,7 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
                 "reason": reason,
                 "hotkey": miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey,
             })
+            _set_error_response(synapse, "rate_limited", f"Rate limited: {reason}")
             return None
         
         payload = synapse.payload if isinstance(synapse.payload, dict) else {}
@@ -66,6 +77,8 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
                     "current_epoch": current_epoch,
                     "accepted_epochs": [current_epoch, max(0, current_epoch - 1)],
                 })
+                msg = "Token missing" if not token else "Token expired or invalid"
+                _set_error_response(synapse, "token_invalid", msg)
                 return None
 
         # Route: ODDS_PUSH
@@ -73,6 +86,10 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
             event = await validator.handlers.ingest_odds_handler.handle_synapse(synapse)
             if event is not None:
                 await validator.handlers.odds_score_handler.score_event(event)
+                # Set success response
+                synapse.payload = {"success": True, "accepted": True}
+            else:
+                synapse.payload = {"success": True, "accepted": False, "message": "No valid submissions"}
             return event
 
         # Route: OUTCOME_PUSH
@@ -80,6 +97,9 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
             event = await validator.handlers.ingest_outcome_handler.handle_synapse(synapse)
             if event is not None:
                 await validator.handlers.outcome_score_handler.score_event(event)
+                synapse.payload = {"success": True, "accepted": True}
+            else:
+                synapse.payload = {"success": True, "accepted": False, "message": "No valid outcome"}
             return event
 
         # Route: GAME_DATA_REQUEST (miner pulls events/markets)
@@ -90,7 +110,9 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
             return response
 
         bt.logging.info({"synapse_listener": "ignored", "type": synapse_type})
+        _set_error_response(synapse, "unknown_type", f"Unknown synapse type: {synapse_type}")
         return None
     except Exception as e:
         bt.logging.warning({"synapse_listener_error": str(e)})
+        _set_error_response(synapse, "internal_error", str(e))
         return None

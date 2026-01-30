@@ -48,24 +48,81 @@ class ValidatorClient:
         except Exception:
             return []
 
+    def _check_response_errors(self, responses: Any, operation: str) -> bool:
+        """Check response for errors and log them.
+        
+        Returns True if successful, False if there were errors.
+        """
+        if not responses:
+            return True  # No response to check
+        
+        for i, resp in enumerate(responses if isinstance(responses, list) else [responses]):
+            # Extract payload from response
+            if isinstance(resp, dict):
+                result = resp
+            elif hasattr(resp, "payload") and isinstance(resp.payload, dict):
+                result = resp.payload
+            else:
+                continue
+            
+            # Check for error response from validator
+            if result.get("success") is False or "error" in result:
+                error_code = result.get("error", "unknown")
+                message = result.get("message", "No details")
+                bt.logging.warning({
+                    f"{operation}_rejected": {
+                        "error": error_code,
+                        "message": message,
+                        "validator_index": i,
+                    }
+                })
+                return False
+            
+            # Log if submission was not accepted (but no error)
+            if result.get("accepted") is False:
+                bt.logging.info({
+                    f"{operation}_not_accepted": {
+                        "message": result.get("message", "Submission not accepted"),
+                        "validator_index": i,
+                    }
+                })
+        
+        return True
+
     async def submit_odds(self, payload: dict, *, timeout: float = 12.0) -> bool:
-        """Submit odds to validators."""
+        """Submit odds to validators.
+        
+        Returns True if submission was accepted, False otherwise.
+        Logs any errors received from validators.
+        """
         syn = SparketSynapse(type=SparketSynapseType.ODDS_PUSH, payload=payload)
         axons = self._select_validator_axons()
+        if not axons:
+            bt.logging.warning({"submit_odds": "no_validators_available"})
+            return False
         try:
-            await self._dendrite.forward(axons=axons, synapse=syn, timeout=timeout)
-            return True
-        except Exception:
+            responses = await self._dendrite.forward(axons=axons, synapse=syn, timeout=timeout)
+            return self._check_response_errors(responses, "submit_odds")
+        except Exception as e:
+            bt.logging.warning({"submit_odds_exception": str(e)})
             return False
 
     async def submit_outcome(self, payload: dict, *, timeout: float = 12.0) -> bool:
-        """Submit outcome to validators."""
+        """Submit outcome to validators.
+        
+        Returns True if submission was accepted, False otherwise.
+        Logs any errors received from validators.
+        """
         syn = SparketSynapse(type=SparketSynapseType.OUTCOME_PUSH, payload=payload)
         axons = self._select_validator_axons()
+        if not axons:
+            bt.logging.warning({"submit_outcome": "no_validators_available"})
+            return False
         try:
-            await self._dendrite.forward(axons=axons, synapse=syn, timeout=timeout)
-            return True
-        except Exception:
+            responses = await self._dendrite.forward(axons=axons, synapse=syn, timeout=timeout)
+            return self._check_response_errors(responses, "submit_outcome")
+        except Exception as e:
+            bt.logging.warning({"submit_outcome_exception": str(e)})
             return False
 
     async def fetch_game_data(
