@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import bittensor as bt
 
@@ -56,6 +56,7 @@ class BaseMiner:
         config: BaseMinerConfig,
         validator_client: Any,
         game_sync: Any,
+        get_token: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         """Initialize the base miner.
         
@@ -64,11 +65,13 @@ class BaseMiner:
             config: Configuration
             validator_client: Client for submitting to validators
             game_sync: GameDataSync for fetching markets
+            get_token: Callback to get the current validator push token
         """
         self.hotkey = hotkey
         self.config = config
         self.validator_client = validator_client
         self.game_sync = game_sync
+        self._get_token = get_token
         
         # Components
         self._espn = ESPNFetcher(cache_ttl_seconds=config.cache_ttl_seconds)
@@ -309,7 +312,7 @@ class BaseMiner:
                 {"side": "under", "odds_eu": odds.under_odds_eu or odds.away_odds_eu, "imp_prob": odds.under_prob or odds.away_prob},
             ]
         
-        return {
+        payload: Dict[str, Any] = {
             "miner_hotkey": self.hotkey,
             "submissions": [{
                 "market_id": int(market.get("market_id", 0)),
@@ -318,6 +321,12 @@ class BaseMiner:
                 "prices": prices,
             }],
         }
+        # Include token for authentication
+        if self._get_token is not None:
+            token = self._get_token()
+            if token:
+                payload["token"] = token
+        return payload
     
     async def _outcome_loop(self) -> None:
         """Background loop for outcome submission."""
@@ -380,7 +389,7 @@ class BaseMiner:
         """Build outcome submission payload."""
         now = datetime.now(timezone.utc)
         
-        return {
+        payload: Dict[str, Any] = {
             "event_id": int(event.get("event_id", 0)),
             "miner_hotkey": self.hotkey,
             "result": result.winner,
@@ -388,6 +397,12 @@ class BaseMiner:
             "score_away": result.away_score,
             "ts_submit": now.isoformat(),
         }
+        # Include token for authentication
+        if self._get_token is not None:
+            token = self._get_token()
+            if token:
+                payload["token"] = token
+        return payload
 
 
 

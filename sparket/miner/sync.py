@@ -213,7 +213,7 @@ class GameDataSync:
         if self._last_sync_ts:
             return self._last_sync_ts
         try:
-            rows = await self.database.read(_SELECT_LAST_SYNC, mappings=True)
+            rows = await self.database.read(_SELECT_LAST_SYNC)
             if rows and rows[0].get("last_sync"):
                 ts = rows[0]["last_sync"]
                 if ts.tzinfo is None:

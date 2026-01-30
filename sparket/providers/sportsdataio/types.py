@@ -134,8 +134,8 @@ def decimal_to_implied_prob(decimal_odds: float | None) -> Optional[float]:
 class Team(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore", frozen=True)
 
-    team_id: int = Field(alias="TeamID")
-    key: str = Field(alias="Key")
+    team_id: int = Field(validation_alias=AliasChoices("TeamID", "TeamId"))
+    key: str = Field(default="", validation_alias=AliasChoices("Key", "TeamKey", "ShortName"))
     city: Optional[str] = Field(default=None, alias="City")
     name: Optional[str] = Field(default=None, alias="Name")
     conference: Optional[str] = Field(default=None, alias="Conference")

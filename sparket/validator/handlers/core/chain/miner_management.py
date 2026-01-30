@@ -120,6 +120,7 @@ class MinerManagementHandler:
                             "uid": uid,
                             "old_hotkey": old_miner["hotkey"][:16] + "...",
                             "new_hotkey": hotkey[:16] + "...",
+                            "old_miner_id": old_miner["miner_id"],
                         })
                         
                         bt.logging.info({

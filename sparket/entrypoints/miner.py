@@ -156,6 +156,8 @@ class Miner(BaseMinerNeuron):
         super(Miner, self).__init__(config=config)
 
         self._validator_cache: dict[str, dict[str, object]] = {}
+        # Primary validator endpoint (set when CONNECTION_INFO_PUSH received)
+        self.validator_endpoint: Optional[dict[str, object]] = None
         
         # Base miner for automatic odds generation
         self.base_miner: Optional["BaseMiner"] = None
@@ -276,13 +278,25 @@ class Miner(BaseMinerNeuron):
             url=url,
             token=token,
         )
-        self._validator_cache[hotkey] = {
+        endpoint_data = {
+            "hotkey": hotkey,
             "host": host,
             "port": port,
             "url": url,
             "token": token,
         }
-        bt.logging.info({"miner_validator_endpoint_updated": {"hotkey": hotkey, "host": host, "port": port, "url": url}})
+        self._validator_cache[hotkey] = endpoint_data
+        # Also set the primary validator_endpoint for MinerService/ValidatorClient to use
+        self.validator_endpoint = endpoint_data
+        bt.logging.info({
+            "miner_validator_endpoint_updated": {
+                "hotkey": hotkey,
+                "host": host,
+                "port": port,
+                "url": url,
+                "token_received": bool(token),
+            }
+        })
 
     def initialize_base_miner(self) -> bool:
         """Initialize the base miner for automatic odds generation.
@@ -313,11 +327,17 @@ class Miner(BaseMinerNeuron):
         
         try:
             hotkey = self.wallet.hotkey.ss58_address
+            # Token getter for base miner authentication
+            def _get_token() -> Optional[str]:
+                endpoint = getattr(self, "validator_endpoint", None) or {}
+                return endpoint.get("token") if isinstance(endpoint, dict) else None
+            
             self.base_miner = BaseMiner(
                 hotkey=hotkey,
                 config=base_config,
                 validator_client=self.validator_client,
                 game_sync=self.game_sync,
+                get_token=_get_token,
             )
             bt.logging.info({
                 "base_miner": "initialized",

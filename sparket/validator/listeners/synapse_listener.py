@@ -56,7 +56,16 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
         
         if requires_token and comms is not None and getattr(comms, "require_token", False):
             if not comms.verify_token(token=token, step=validator.step):
-                bt.logging.warning({"synapse_listener": "token_invalid"})
+                current_epoch = validator.step // comms.step_rotation
+                bt.logging.warning({
+                    "synapse_listener": "token_invalid",
+                    "miner_hotkey": miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey,
+                    "token_provided": bool(token),
+                    "token_preview": token[:8] + "..." if token else None,
+                    "validator_step": validator.step,
+                    "current_epoch": current_epoch,
+                    "accepted_epochs": [current_epoch, max(0, current_epoch - 1)],
+                })
                 return None
 
         # Route: ODDS_PUSH
