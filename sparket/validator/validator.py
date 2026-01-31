@@ -37,7 +37,7 @@ from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
 from sparket.validator.comms import ValidatorComms
 from sparket.validator.handlers.handlers import Handlers
 from sparket.validator.services import SportsDataIngestor
-from sparket.validator.utils.runtime import concurrent_forward, next_backoff_delay, resolve_loop_timeouts
+from sparket.validator.utils.runtime import next_backoff_delay, resolve_loop_timeouts
 from sparket.validator.utils.startup import (
     check_python_requirements,
     ping_database,
@@ -139,6 +139,16 @@ class BaseValidatorNeuron(BaseNeuron):
                 axon.stop()
         except Exception as e:
             bt.logging.warning({"validator_context": {"axon_stop_error": str(e)}})
+
+        # Close the main dendrite session
+        try:
+            dendrite = getattr(self, "dendrite", None)
+            if dendrite is not None:
+                loop = getattr(self, "loop", None)
+                if loop and not loop.is_closed():
+                    loop.run_until_complete(dendrite.aclose())
+        except Exception as e:
+            bt.logging.warning({"validator_context": {"dendrite_close_error": str(e)}})
 
         try:
             dbm = getattr(self, "dbm", None)
@@ -493,11 +503,28 @@ class BaseValidatorNeuron(BaseNeuron):
         except Exception as e:
             bt.logging.warning({"validator_serve_axon_error": str(e)})
 
-    async def forward(self) -> None:
+    async def forward(self, synapse: bt.Synapse) -> bt.Synapse:
+        """Handle incoming synapse requests.
+        
+        This satisfies the abstract method from BaseNeuron.
+        Actual routing is handled by the function attached via axon.attach().
+        """
+        # The axon's attached _forward function handles incoming requests.
+        # This method exists to satisfy the ABC requirement.
+        # If called directly, route through the same logic.
+        from sparket.validator.listeners.synapse_listener import route_incoming_synapse
+        try:
+            await route_incoming_synapse(self, synapse)  # type: ignore[arg-type]
+        except Exception as e:
+            bt.logging.warning({"forward_direct_error": str(e)})
+        return synapse
+
+    async def _push_connection_info(self) -> None:
         """Push connection info (including auth token) to miners periodically.
         
-        This implements the abstract forward method from BaseNeuron.
         Miners use this information to submit odds/outcomes back to the validator.
+        This is called from the main loop on each iteration, but only broadcasts
+        when the configured interval has elapsed.
         """
         import time as _time
         
@@ -555,53 +582,58 @@ class BaseValidatorNeuron(BaseNeuron):
                 bt.logging.debug({"forward": "no_miner_axons"})
                 return
             
-            # Push to miners using dendrite
-            dendrite = getattr(self, "dendrite", None)
-            if dendrite is None:
-                dendrite = bt.Dendrite(wallet=self.wallet)
-                self.dendrite = dendrite
-            
-            responses = await dendrite.forward(
-                axons=axons,
-                synapse=synapse,
-                timeout=12.0,
-            )
-            
-            # Categorize responses for detailed summary
-            success_count = 0
-            timeout_count = 0
-            error_count = 0
-            unreachable_count = 0
-            
-            for i, resp in enumerate(responses or []):
-                # Get status info from response
-                dendrite_info = getattr(resp, "dendrite", None)
-                status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
-                status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
+            # Push to miners using a fresh dendrite with proper cleanup
+            broadcast_dendrite = bt.Dendrite(wallet=self.wallet)
+            try:
+                # Use longer timeout since many miners are slow to respond
+                responses = await broadcast_dendrite.forward(
+                    axons=axons,
+                    synapse=synapse,
+                    timeout=20.0,  # Increased from 12s to get more responses
+                    deserialize=False,  # Keep full response to access dendrite.status_code
+                )
                 
-                if status_code is None or status_code == 0:
-                    # No response / connection failed
-                    unreachable_count += 1
-                elif status_code == 408 or "timeout" in status_msg.lower():
-                    # Timeout
-                    timeout_count += 1
-                elif status_code >= 400:
-                    # Other error (4xx/5xx)
-                    error_count += 1
-                else:
-                    # Success (2xx/3xx)
-                    success_count += 1
-            
-            self._last_connection_push = now
-            
-            # Log detailed summary
-            total = len(axons)
-            success_pct = (success_count / total * 100) if total > 0 else 0
-            bt.logging.info(
-                f"{LogColors.NETWORK_LABEL} connection_broadcast: "
-                f"total={total}, success={success_count} ({success_pct:.0f}%), "
-                f"timeout={timeout_count}, error={error_count}, unreachable={unreachable_count}"
-            )
+                # Categorize responses for detailed summary
+                success_count = 0
+                timeout_count = 0
+                error_count = 0
+                unreachable_count = 0
+                
+                for i, resp in enumerate(responses or []):
+                    # Get status info from response
+                    dendrite_info = getattr(resp, "dendrite", None)
+                    status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
+                    status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
+                    
+                    if status_code is None or status_code == 0:
+                        # No response / connection failed
+                        unreachable_count += 1
+                    elif status_code == 408 or "timeout" in status_msg.lower():
+                        # Timeout
+                        timeout_count += 1
+                    elif status_code >= 400:
+                        # Other error (4xx/5xx)
+                        error_count += 1
+                    else:
+                        # Success (2xx/3xx)
+                        success_count += 1
+                
+                self._last_connection_push = now
+                
+                # Log detailed summary
+                total = len(axons)
+                success_pct = (success_count / total * 100) if total > 0 else 0
+                bt.logging.info(
+                    f"{LogColors.NETWORK_LABEL} connection_broadcast: "
+                    f"total={total}, success={success_count} ({success_pct:.0f}%), "
+                    f"timeout={timeout_count}, error={error_count}, unreachable={unreachable_count}"
+                )
+            finally:
+                # Always clean up the dendrite session
+                try:
+                    await broadcast_dendrite.aclose()
+                except Exception:
+                    pass
             
         except Exception as e:
             bt.logging.warning({"connection_push_error": str(e)})
@@ -777,14 +809,14 @@ class BaseValidatorNeuron(BaseNeuron):
                         }
                     )
 
-                    bt.logging.debug({"validator_loop": {"phase": "connection_forward_start"}})
+                    bt.logging.debug({"validator_loop": {"phase": "connection_push_start"}})
                     try:
                         self.loop.run_until_complete(
-                            asyncio.wait_for(concurrent_forward(self), timeout=timeouts["forward"])
+                            asyncio.wait_for(self._push_connection_info(), timeout=timeouts["forward"])
                         )
                     except asyncio.TimeoutError:
-                        bt.logging.warning({"validator_loop": {"phase": "connection_forward_timeout"}})
-                    bt.logging.debug({"validator_loop": {"phase": "connection_forward_complete"}})
+                        bt.logging.warning({"validator_loop": {"phase": "connection_push_timeout"}})
+                    bt.logging.debug({"validator_loop": {"phase": "connection_push_complete"}})
 
                     from sparket.validator.handlers.score.main_score import (
                         run_main_scoring_if_due_async,
@@ -937,9 +969,26 @@ class BaseValidatorNeuron(BaseNeuron):
                     backoff_sec = next_backoff_delay(backoff_sec, factor=backoff_factor, max_delay=max_backoff_sec)
 
         except KeyboardInterrupt:
-            self.axon.stop()
+            self._cleanup()
             bt.logging.success("Validator killed by keyboard interrupt.")
             exit()
+    
+    def _cleanup(self):
+        """Clean up resources on shutdown."""
+        try:
+            if hasattr(self, 'axon') and self.axon:
+                self.axon.stop()
+        except Exception:
+            pass
+        
+        # Close the main dendrite session
+        try:
+            if hasattr(self, 'dendrite') and self.dendrite:
+                # Run aclose in the event loop
+                if hasattr(self, 'loop') and self.loop and not self.loop.is_closed():
+                    self.loop.run_until_complete(self.dendrite.aclose())
+        except Exception:
+            pass
 
     def set_weights(self):
         """Set weights on chain using scores from database."""
