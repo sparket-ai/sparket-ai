@@ -10,6 +10,8 @@ Notes:
 - Requires an async Postgres URL, e.g. postgresql+asyncpg://user:pass@host:port/db
 - The Config object is expected to provide `database_url`; alternatively, the
   DATABASE_URL environment variable will be used.
+- When use_null_pool=True, creates fresh connections per request to avoid
+  event loop conflicts (slower but safe for cross-loop access).
 """
 
 import logging
@@ -20,6 +22,7 @@ from typing import Any, Callable, Mapping, Optional, Union
 
 from sparket.validator.config.config import Config
 from sqlalchemy import text
+from sqlalchemy.pool import NullPool
 
 # Suppress verbose SQLAlchemy engine logging
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
@@ -46,6 +49,7 @@ class DBM:
         pool_timeout: int = 30,
         pool_recycle: int = 1800,
         echo: bool = False,
+        use_null_pool: bool = False,
     ) -> None:
         self.config = config
 
@@ -57,17 +61,28 @@ class DBM:
                 "Database URL not provided. Set Config.database_url or DATABASE_URL."
             )
 
-        self.engine: AsyncEngine = create_async_engine(
-            database_url,
-            echo=echo,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
-            pool_pre_ping=True,
-            pool_reset_on_return="rollback",
-            future=True,
-        )
+        # NullPool creates fresh connections per request - slower but avoids
+        # event loop conflicts when DB is accessed from multiple async contexts
+        # (e.g., main loop + axon handlers + background tasks)
+        if use_null_pool:
+            self.engine: AsyncEngine = create_async_engine(
+                database_url,
+                echo=echo,
+                poolclass=NullPool,
+                future=True,
+            )
+        else:
+            self.engine: AsyncEngine = create_async_engine(
+                database_url,
+                echo=echo,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+                pool_recycle=pool_recycle,
+                pool_pre_ping=True,
+                pool_reset_on_return="rollback",
+                future=True,
+            )
 
         self.session_maker: async_sessionmaker[AsyncSession] = async_sessionmaker(
             bind=self.engine,
@@ -85,7 +100,17 @@ class DBM:
         pool_size: int = 50,
         max_overflow: int = 10,
         echo: bool = False,
+        use_null_pool: bool = True,  # Default True to avoid cross-loop issues
     ) -> "DBM":
+        """Get or create the singleton DBM instance.
+        
+        Args:
+            use_null_pool: If True (default), creates fresh connections per request.
+                          This is slower but avoids event loop conflicts when the
+                          validator uses multiple async contexts (main loop, axon
+                          handlers, background tasks). Set to False only if you're
+                          certain all DB access happens in the same event loop.
+        """
         if cls._manager_instance is not None:
             return cls._manager_instance
         with cls._manager_lock:
@@ -95,6 +120,7 @@ class DBM:
                     pool_size=pool_size,
                     max_overflow=max_overflow,
                     echo=echo,
+                    use_null_pool=use_null_pool,
                 )
         return cls._manager_instance
 
@@ -106,13 +132,18 @@ class DBM:
         pool_size: int = 10,
         max_overflow: int = 5,
         echo: bool = False,
+        use_null_pool: bool = False,  # Workers typically run in single loop
     ) -> "DBM":
-        # Independent, lightweight instance; not stored as a singleton
+        """Create an independent DBM instance for worker processes.
+        
+        Workers typically run in a single event loop, so pooling is safe.
+        """
         return cls(
             config,
             pool_size=pool_size,
             max_overflow=max_overflow,
             echo=echo,
+            use_null_pool=use_null_pool,
         )
 
     # Session helpers

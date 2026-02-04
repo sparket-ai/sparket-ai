@@ -146,8 +146,18 @@ class GameDataHandler:
                     "game_data_request": {
                         "games_count": len(games),
                         "markets_count": len(markets),
+                        "response_keys": list(response.keys()) if response else [],
                     }
                 })
+                
+                # Defensive check - should never happen but helps debug
+                if not response or not isinstance(response, dict) or "games" not in response:
+                    bt.logging.error({
+                        "game_data_handler_unexpected": {
+                            "response_type": type(response).__name__,
+                            "response": str(response)[:200] if response else "None",
+                        }
+                    })
                 
                 return response
             finally:

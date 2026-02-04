@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import bittensor as bt
@@ -13,6 +14,8 @@ from sparket.validator.scoring.jobs.calibration_sharpness import CalibrationShar
 from sparket.validator.scoring.jobs.originality_lead_lag import OriginalityLeadLagJob
 from sparket.validator.scoring.jobs.skill_score import SkillScoreJob
 from sparket.validator.scoring.ground_truth.snapshot_pipeline import SnapshotPipeline
+from sparket.validator.handlers.score.odds_score import OddsScoreHandler
+from sparket.validator.handlers.score.outcome_score import OutcomeScoreHandler
 
 
 class MainScoreHandler:
@@ -56,22 +59,50 @@ class MainScoreHandler:
                 pipeline = SnapshotPipeline(db=self.database, logger=bt.logging)
                 snapshot_count = await pipeline.run_snapshot_cycle()
                 closing_count = await pipeline.capture_closing_snapshots()
+                # Capture late closing snapshots for events that were missed
+                late_closing_count = await pipeline.capture_late_closing_snapshots()
                 gt_count = await pipeline.populate_ground_truth_closing()
                 
                 results["snapshots"] = snapshot_count
                 results["closing_snapshots"] = closing_count
+                results["late_closing"] = late_closing_count
                 results["ground_truth"] = gt_count
                 
                 bt.logging.info({
                     "main_score_snapshots": {
                         "snapshots": snapshot_count,
                         "closing": closing_count,
+                        "late_closing": late_closing_count,
                         "ground_truth": gt_count,
                     }
                 })
             except Exception as e:
                 bt.logging.warning({"main_score_snapshot_error": str(e)})
                 results["errors"].append(f"snapshot_pipeline: {e}")
+
+            # Phase 1.5: Batch score unscored submissions (CLV and outcomes)
+            try:
+                since = datetime.now(timezone.utc) - timedelta(days=7)
+                
+                # Score CLV for submissions with ground truth closing
+                odds_handler = OddsScoreHandler(self.database)
+                clv_scored = await odds_handler.score_batch(since=since, limit=5000)
+                results["clv_scored"] = clv_scored
+                
+                # Score outcomes for submissions with settled markets
+                outcome_handler = OutcomeScoreHandler(self.database)
+                outcome_scored = await outcome_handler.score_batch(since=since, limit=5000)
+                results["outcome_scored"] = outcome_scored
+                
+                bt.logging.info({
+                    "main_score_batch": {
+                        "clv_scored": clv_scored,
+                        "outcome_scored": outcome_scored,
+                    }
+                })
+            except Exception as e:
+                bt.logging.warning({"main_score_batch_error": str(e)})
+                results["errors"].append(f"batch_scoring: {e}")
 
             # Phase 2: Run scoring jobs in dependency order
             job_classes = [
@@ -132,19 +163,23 @@ class MainScoreHandler:
     async def run_snapshots(self) -> dict:
         """Run only the ground truth snapshot pipeline."""
         bt.logging.info({"main_score_snapshots": "start"})
-        results = {"snapshots": 0, "closing_snapshots": 0, "ground_truth": 0, "errors": []}
+        results = {"snapshots": 0, "closing_snapshots": 0, "late_closing": 0, "ground_truth": 0, "errors": []}
         try:
             pipeline = SnapshotPipeline(db=self.database, logger=bt.logging)
             snapshot_count = await pipeline.run_snapshot_cycle()
             closing_count = await pipeline.capture_closing_snapshots()
+            # Capture late closing snapshots for events that were missed
+            late_closing_count = await pipeline.capture_late_closing_snapshots()
             gt_count = await pipeline.populate_ground_truth_closing()
             results["snapshots"] = snapshot_count
             results["closing_snapshots"] = closing_count
+            results["late_closing"] = late_closing_count
             results["ground_truth"] = gt_count
             bt.logging.info({
                 "main_score_snapshots": {
                     "snapshots": snapshot_count,
                     "closing": closing_count,
+                    "late_closing": late_closing_count,
                     "ground_truth": gt_count,
                 }
             })

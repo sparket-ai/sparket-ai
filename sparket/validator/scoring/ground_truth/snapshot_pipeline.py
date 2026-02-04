@@ -136,6 +136,27 @@ _SELECT_MARKETS_STARTING_SOON = text("""
       )
 """)
 
+# Markets that have started but never got a closing snapshot (recovery case)
+_SELECT_MARKETS_MISSED_CLOSING = text("""
+    SELECT DISTINCT m.market_id, e.start_time_utc, e.event_id
+    FROM market m
+    JOIN event e ON m.event_id = e.event_id
+    WHERE e.start_time_utc < :now
+      AND e.start_time_utc > :min_time
+      AND e.status IN ('scheduled', 'in_play', 'finished')
+      AND NOT EXISTS (
+          SELECT 1 FROM ground_truth_snapshot gs
+          WHERE gs.market_id = m.market_id
+            AND gs.is_closing = true
+      )
+      AND EXISTS (
+          SELECT 1 FROM miner_submission ms
+          WHERE ms.market_id = m.market_id
+      )
+    ORDER BY e.start_time_utc DESC
+    LIMIT :limit
+""")
+
 # Copy closing snapshots to ground_truth_closing for scoring
 _UPSERT_GROUND_TRUTH_CLOSING = text("""
     INSERT INTO ground_truth_closing (
@@ -278,6 +299,78 @@ class SnapshotPipeline:
             if snapshots:
                 await self._persist_snapshots(snapshots)
                 snapshot_count += len(snapshots)
+        
+        return snapshot_count
+
+    async def capture_late_closing_snapshots(self, limit: int = 50) -> int:
+        """Capture closing snapshots for markets that already started but were missed.
+        
+        This is a recovery mechanism for events where we failed to capture
+        a closing snapshot before the event started. Uses the most recent
+        provider quote before event start as the "closing" line.
+        
+        Args:
+            limit: Max number of markets to process per call
+            
+        Returns:
+            Number of closing snapshots created
+        """
+        now = datetime.now(timezone.utc)
+        # Look back up to 7 days for missed events
+        min_time = now - timedelta(days=7)
+        
+        bias_states = await self._load_bias_states()
+        bias_version = max((s.version for s in bias_states.values()), default=1)
+        
+        markets = await self.db.read(
+            _SELECT_MARKETS_MISSED_CLOSING,
+            params={"now": now, "min_time": min_time, "limit": limit},
+            mappings=True,
+        )
+        
+        if not markets:
+            return 0
+        
+        self.logger.info({
+            "late_closing_capture": {
+                "markets_found": len(markets),
+            }
+        })
+        
+        snapshot_count = 0
+        
+        for market in markets:
+            market_id = market["market_id"]
+            start_time = market["start_time_utc"]
+            
+            # Use start_time as the snapshot timestamp (closing line)
+            # This will use quotes from before the event started
+            snapshots = await self._compute_market_snapshots(
+                market_id=market_id,
+                snapshot_ts=start_time,
+                bias_states=bias_states,
+                bias_version=bias_version,
+                is_closing=True,
+            )
+            
+            if snapshots:
+                await self._persist_snapshots(snapshots)
+                snapshot_count += len(snapshots)
+                self.logger.debug({
+                    "late_closing_captured": {
+                        "market_id": market_id,
+                        "event_id": market.get("event_id"),
+                        "start_time": str(start_time),
+                        "snapshots": len(snapshots),
+                    }
+                })
+        
+        if snapshot_count > 0:
+            self.logger.info({
+                "late_closing_complete": {
+                    "snapshots_created": snapshot_count,
+                }
+            })
         
         return snapshot_count
     

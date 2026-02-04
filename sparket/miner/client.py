@@ -89,7 +89,7 @@ class ValidatorClient:
         Returns:
             Tuple of (success: bool, should_backoff: bool)
             - success: True if submission was accepted
-            - should_backoff: True if validator returned "not_ready"
+            - should_backoff: True if validator returned "not_ready" or cooldown
         """
         if not responses:
             return True, False  # No response to check
@@ -97,6 +97,41 @@ class ValidatorClient:
         should_backoff = False
         
         for i, resp in enumerate(responses if isinstance(responses, list) else [responses]):
+            # Check dendrite status code FIRST (security middleware rejections)
+            dendrite_info = getattr(resp, "dendrite", None)
+            status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
+            status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
+            
+            # Handle HTTP-level rejection from security middleware
+            if status_code == 429:
+                # Cooldown - need to back off
+                bt.logging.info({
+                    f"{operation}_cooldown": {
+                        "status_code": status_code,
+                        "message": status_msg,
+                        "will_backoff": True,
+                    }
+                })
+                return False, True  # Failed, should backoff
+            elif status_code == 403:
+                # Forbidden (blacklisted or not registered)
+                bt.logging.warning({
+                    f"{operation}_forbidden": {
+                        "status_code": status_code,
+                        "message": status_msg,
+                    }
+                })
+                return False, False  # Failed, no backoff (won't help)
+            elif status_code is not None and status_code >= 400:
+                # Other HTTP error
+                bt.logging.warning({
+                    f"{operation}_http_error": {
+                        "status_code": status_code,
+                        "message": status_msg,
+                    }
+                })
+                return False, False
+            
             # Extract payload from response
             if isinstance(resp, dict):
                 result = resp
@@ -261,6 +296,43 @@ class ValidatorClient:
             
             if responses and len(responses) > 0:
                 response = responses[0]
+                
+                # Check dendrite status code FIRST before processing response
+                # Security middleware may reject with 429 (cooldown) or 403 (blacklist)
+                dendrite_info = getattr(response, "dendrite", None)
+                status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
+                status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
+                
+                # Handle rejection responses (don't treat as valid game data)
+                if status_code == 429:
+                    # Cooldown - extract retry time if available
+                    bt.logging.info({
+                        "fetch_game_data_cooldown": {
+                            "status_code": status_code,
+                            "message": status_msg,
+                            "will_backoff": True,
+                        }
+                    })
+                    self._trigger_backoff()
+                    return None
+                elif status_code == 403:
+                    # Forbidden (blacklisted or not registered)
+                    bt.logging.warning({
+                        "fetch_game_data_forbidden": {
+                            "status_code": status_code,
+                            "message": status_msg,
+                        }
+                    })
+                    return None
+                elif status_code is not None and status_code >= 400:
+                    # Other error response
+                    bt.logging.warning({
+                        "fetch_game_data_error_response": {
+                            "status_code": status_code,
+                            "message": status_msg,
+                        }
+                    })
+                    return None
                 
                 # Handle both SparketSynapse and dict responses
                 # Bittensor may return the deserialized payload directly as a dict

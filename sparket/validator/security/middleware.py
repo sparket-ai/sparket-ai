@@ -6,6 +6,7 @@ at the HTTP level, before full synapse deserialization.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any, Optional
 
 from fastapi.responses import JSONResponse
@@ -16,6 +17,7 @@ from starlette.responses import Response
 import bittensor as bt
 
 from sparket.shared.log_colors import LogColors
+from .config import FailureType
 
 if TYPE_CHECKING:
     from .manager import SecurityManager
@@ -53,8 +55,14 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         # Get client IP (handle proxies)
         ip = self._get_client_ip(request)
         
-        # Skip security checks for non-synapse endpoints (health checks, etc.)
         path = request.url.path
+        
+        # Check for scanner/probe requests (GET / or empty path without valid bittensor headers)
+        # These are bots probing the endpoint - immediately blacklist the IP
+        if self._is_scanner_request(request, path, hotkey, ip):
+            return await self._handle_scanner_request(ip)
+        
+        # Skip security checks for legitimate non-synapse endpoints (health checks, etc.)
         if not self._is_synapse_endpoint(path):
             return await call_next(request)
         
@@ -84,6 +92,13 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             # Using 429 Too Many Requests for cooldowns
             is_cooldown = reason and "cooldown" in reason
             status_code = 429 if is_cooldown else 403
+            
+            # Track cooldown violations for fail2ban
+            # If they keep submitting while in cooldown, trigger 24h ban
+            if is_cooldown:
+                asyncio.create_task(
+                    self.security_manager.record_cooldown_violation(hotkey, ip)
+                )
             
             # Build response content
             content: dict = {
@@ -135,14 +150,86 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         
         return None
     
+    def _is_scanner_request(
+        self,
+        request: Request,
+        path: str,
+        hotkey: Optional[str],
+        ip: Optional[str],
+    ) -> bool:
+        """Detect scanner/probe requests that should trigger immediate blacklist.
+        
+        Scanners typically:
+        - Hit root path "/" with no valid bittensor headers
+        - Make requests without proper synapse names
+        - Probe common paths looking for vulnerabilities
+        
+        Legitimate bittensor clients always include dendrite headers.
+        """
+        # Paths that scanners commonly hit
+        scanner_paths = {"/", "/admin", "/api", "/login", "/wp-admin", "/robots.txt"}
+        
+        # If hitting a scanner-common path without bittensor headers, it's a scanner
+        if path in scanner_paths:
+            # Check for any bittensor header presence
+            has_bt_headers = any(
+                h.startswith("bt_header_") for h in request.headers.keys()
+            )
+            
+            # No bittensor headers + hitting root/common paths = scanner
+            if not has_bt_headers:
+                return True
+            
+            # Has bittensor headers but hitting "/" with no valid hotkey = malformed
+            if path == "/" and not hotkey:
+                return True
+        
+        return False
+    
+    async def _handle_scanner_request(self, ip: Optional[str]) -> Response:
+        """Handle a detected scanner request by blacklisting and rejecting.
+        
+        Immediately blacklists the IP and returns a 403 response.
+        """
+        if ip:
+            # Check if already blacklisted to avoid duplicate DB writes
+            is_blocked, _ = self.security_manager.is_blacklisted(None, ip)
+            
+            if not is_blocked:
+                bt.logging.warning(
+                    f"{LogColors.MINER_LABEL} scanner_detected: "
+                    f"ip={ip}, action=permanent_blacklist"
+                )
+                
+                # Fire-and-forget blacklist (don't block the response)
+                asyncio.create_task(
+                    self.security_manager.add_to_blacklist(
+                        identifier=ip,
+                        identifier_type="ip",
+                        reason="Scanner/probe request detected (GET / with no valid headers)",
+                        failure_type=FailureType.SCANNER_REQUEST.value,
+                        failure_count=1,
+                    )
+                )
+        
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "error": "forbidden",
+                "message": "Access denied",
+            },
+        )
+    
     def _is_synapse_endpoint(self, path: str) -> bool:
         """Check if the path is a synapse endpoint that needs security checks.
         
         Skip security for health checks, metrics, etc.
+        Note: Scanner paths are handled separately in _is_scanner_request.
         """
         # Bittensor synapse endpoints are typically /{SynapseName}
-        # Skip root, health, and other utility endpoints
-        skip_paths = {"/", "/health", "/healthz", "/ready", "/metrics", "/favicon.ico"}
+        # Skip health and other utility endpoints
+        skip_paths = {"/health", "/healthz", "/ready", "/metrics", "/favicon.ico"}
         
         if path in skip_paths:
             return False

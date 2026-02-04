@@ -169,6 +169,9 @@ class Game(BaseModel):
     home_team: str = Field(alias="HomeTeam")
     away_team: str = Field(alias="AwayTeam")
     location: Optional[Location] = Field(default=None)
+    # Score fields - populated when game is Final/completed
+    home_score: Optional[int] = Field(default=None, alias="HomeScore")
+    away_score: Optional[int] = Field(default=None, alias="AwayScore")
 
     # Cross-sport variants occasionally use different keys; use model-level
     # pre-processing to fill the normalized fields above.

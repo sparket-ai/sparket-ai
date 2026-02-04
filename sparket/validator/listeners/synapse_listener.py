@@ -136,6 +136,17 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
         # Route: GAME_DATA_REQUEST (miner pulls events/markets)
         if synapse_type == SparketSynapseType.GAME_DATA_REQUEST.value:
             response = await validator.handlers.game_data_handler.handle_synapse(synapse)
+            
+            # Defensive logging - should always have games key
+            if not response or not isinstance(response, dict):
+                bt.logging.error({
+                    "game_data_response_invalid": {
+                        "response_type": type(response).__name__ if response else "None",
+                        "hotkey": miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey,
+                    }
+                })
+                response = {"error": "internal_error", "message": "Handler returned invalid response"}
+            
             # Attach response to synapse payload for return
             synapse.payload = response
             return response

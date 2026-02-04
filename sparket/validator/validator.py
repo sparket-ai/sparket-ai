@@ -180,6 +180,17 @@ class BaseValidatorNeuron(BaseNeuron):
         except Exception as e:
             bt.logging.warning({"validator_context": {"sdio_task_cancel_error": str(e)}})
 
+        # Cancel any running broadcast task and close its dendrite
+        try:
+            broadcaster = getattr(self, "_broadcaster", None)
+            if broadcaster is not None:
+                broadcaster.cancel()
+                loop = getattr(self, "loop", None)
+                if loop and not loop.is_closed():
+                    loop.run_until_complete(broadcaster.close())
+        except Exception as e:
+            bt.logging.warning({"validator_context": {"broadcaster_cancel_error": str(e)}})
+
         try:
             ingestor = getattr(self, "sdio_ingestor", None)
             loop = getattr(self, "loop", None)
@@ -336,6 +347,20 @@ class BaseValidatorNeuron(BaseNeuron):
             except Exception as e:
                 bt.logging.warning({"validator_init": {"security_manager_error": str(e)}})
                 self.security_manager = None
+
+            # Initialize broadcaster for non-blocking connection pushes
+            bt.logging.info({"validator_init": {"step": "initializing_broadcaster"}})
+            try:
+                from sparket.validator.broadcaster import ConnectionBroadcaster
+                self._broadcaster = ConnectionBroadcaster(
+                    wallet=self.wallet,
+                    max_concurrent=50,  # Max simultaneous connections
+                    timeout_per_miner=20.0,  # Individual timeout per miner
+                )
+                bt.logging.info({"validator_init": {"step": "broadcaster_initialized"}})
+            except Exception as e:
+                bt.logging.warning({"validator_init": {"broadcaster_error": str(e)}})
+                self._broadcaster = None
 
             # Start scoring worker if enabled
             self.scoring_worker_manager = None
@@ -525,6 +550,9 @@ class BaseValidatorNeuron(BaseNeuron):
         Miners use this information to submit odds/outcomes back to the validator.
         This is called from the main loop on each iteration, but only broadcasts
         when the configured interval has elapsed.
+        
+        Uses fire-and-forget pattern with background batched broadcasting to avoid
+        blocking the main loop while still tracking delivery stats.
         """
         import time as _time
         
@@ -544,6 +572,11 @@ class BaseValidatorNeuron(BaseNeuron):
         # Ensure axon is available
         if not hasattr(self, "axon") or self.axon is None:
             bt.logging.debug({"forward": "axon_not_ready"})
+            return
+        
+        # Ensure broadcaster is initialized
+        if not hasattr(self, "_broadcaster") or self._broadcaster is None:
+            bt.logging.debug({"forward": "broadcaster_not_ready"})
             return
         
         try:
@@ -582,58 +615,28 @@ class BaseValidatorNeuron(BaseNeuron):
                 bt.logging.debug({"forward": "no_miner_axons"})
                 return
             
-            # Push to miners using a fresh dendrite with proper cleanup
-            broadcast_dendrite = bt.Dendrite(wallet=self.wallet)
-            try:
-                # Use longer timeout since many miners are slow to respond
-                responses = await broadcast_dendrite.forward(
-                    axons=axons,
-                    synapse=synapse,
-                    timeout=20.0,  # Increased from 12s to get more responses
-                    deserialize=False,  # Keep full response to access dendrite.status_code
-                )
-                
-                # Categorize responses for detailed summary
-                success_count = 0
-                timeout_count = 0
-                error_count = 0
-                unreachable_count = 0
-                
-                for i, resp in enumerate(responses or []):
-                    # Get status info from response
-                    dendrite_info = getattr(resp, "dendrite", None)
-                    status_code = getattr(dendrite_info, "status_code", None) if dendrite_info else None
-                    status_msg = getattr(dendrite_info, "status_message", "") if dendrite_info else ""
-                    
-                    if status_code is None or status_code == 0:
-                        # No response / connection failed
-                        unreachable_count += 1
-                    elif status_code == 408 or "timeout" in status_msg.lower():
-                        # Timeout
-                        timeout_count += 1
-                    elif status_code >= 400:
-                        # Other error (4xx/5xx)
-                        error_count += 1
-                    else:
-                        # Success (2xx/3xx)
-                        success_count += 1
-                
-                self._last_connection_push = now
-                
-                # Log detailed summary
-                total = len(axons)
-                success_pct = (success_count / total * 100) if total > 0 else 0
-                bt.logging.info(
-                    f"{LogColors.NETWORK_LABEL} connection_broadcast: "
-                    f"total={total}, success={success_count} ({success_pct:.0f}%), "
-                    f"timeout={timeout_count}, error={error_count}, unreachable={unreachable_count}"
-                )
-            finally:
-                # Always clean up the dendrite session
-                try:
-                    await broadcast_dendrite.aclose()
-                except Exception:
-                    pass
+            # Log stats from PREVIOUS broadcast (if available)
+            last_stats = self._broadcaster.get_last_stats()
+            if last_stats:
+                bt.logging.debug({
+                    "previous_broadcast_stats": last_stats,
+                })
+            
+            # Fire-and-forget: start broadcast in background
+            # This returns immediately without waiting for responses
+            started = self._broadcaster.start_broadcast(axons, synapse)
+            
+            if started:
+                bt.logging.debug({
+                    "broadcast_started": {
+                        "total_axons": len(axons),
+                        "fire_and_forget": True,
+                    }
+                })
+            
+            # Update timestamp regardless of whether broadcast started
+            # (if skipped due to already running, we don't want to spam retries)
+            self._last_connection_push = now
             
         except Exception as e:
             bt.logging.warning({"connection_push_error": str(e)})
@@ -944,7 +947,8 @@ class BaseValidatorNeuron(BaseNeuron):
                     bt.logging.debug({"validator_loop": {"phase": "sync_complete"}})
 
                     self.step += 1
-                    time.sleep(30)
+                    # Use async sleep to allow event loop to process other tasks
+                    self.loop.run_until_complete(asyncio.sleep(30))
 
                     failure_count = 0
                     backoff_sec = 5.0
@@ -965,7 +969,8 @@ class BaseValidatorNeuron(BaseNeuron):
                             "sleep_seconds": backoff_sec,
                         }
                     })
-                    time.sleep(backoff_sec)
+                    # Use async sleep to allow event loop to process other tasks
+                    self.loop.run_until_complete(asyncio.sleep(backoff_sec))
                     backoff_sec = next_backoff_delay(backoff_sec, factor=backoff_factor, max_delay=max_backoff_sec)
 
         except KeyboardInterrupt:

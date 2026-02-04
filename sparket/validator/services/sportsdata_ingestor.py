@@ -20,12 +20,44 @@ from sparket.providers.sportsdataio import (
     map_moneyline_quotes,
     map_spread_quotes,
     map_total_quotes,
+    resolve_moneyline_result,
+    resolve_spread_result,
+    resolve_total_result,
 )
 from sparket.providers.sportsdataio.catalog import team_rows_from_catalog, build_team_index_by_sdio
+from sparket.providers.sportsdataio.enums import GameStatus
 from sparket.providers.sportsdataio.types import Game, GameOdds, GameOddsSet, Team
 from sparket.validator.database.resolver import ensure_event_for_sdio, ensure_market
 from sparket.validator.handlers.ingest.provider_ingest import insert_provider_quotes, upsert_provider_closing_for_event
 from sparket.shared.rows import ProviderQuoteRow
+
+
+# SQL for event status sync and outcome recording
+_UPDATE_EVENT_STATUS = text("""
+    UPDATE event SET status = :status
+    WHERE event_id = :event_id AND status != :status
+""")
+
+_SELECT_MARKETS_FOR_EVENT = text("""
+    SELECT market_id, kind, line, points_team_id
+    FROM market
+    WHERE event_id = :event_id
+""")
+
+_UPSERT_OUTCOME = text("""
+    INSERT INTO outcome (market_id, settled_at, result, score_home, score_away, details)
+    VALUES (:market_id, :settled_at, :result, :score_home, :score_away, :details)
+    ON CONFLICT (market_id) DO UPDATE SET
+        settled_at = EXCLUDED.settled_at,
+        result = EXCLUDED.result,
+        score_home = EXCLUDED.score_home,
+        score_away = EXCLUDED.score_away,
+        details = EXCLUDED.details
+""")
+
+_CHECK_OUTCOME_EXISTS = text("""
+    SELECT 1 FROM outcome WHERE market_id = :market_id LIMIT 1
+""")
 
 
 @dataclass
@@ -296,18 +328,43 @@ class SportsDataIngestor:
         end_cutoff = now + timedelta(days=state.config.track_days_ahead)
         total_upserts = 0
         tracked = 0
+        status_updates = 0
+        outcomes_recorded = 0
         for game in games:
             if not game.date_time:
                 continue
             event_id, start_time, home_id, away_id = await self._upsert_event(state, game, team_index)
             total_upserts += 1
+            
+            # Sync event status and record outcomes for finished games
+            try:
+                updated = await self._sync_event_status(event_id, game, now)
+                if updated:
+                    status_updates += 1
+                    # If game is final/finished, record outcomes
+                    if self._is_game_final(game):
+                        recorded = await self._record_outcomes(event_id, game, home_id, away_id)
+                        outcomes_recorded += recorded
+            except Exception as e:
+                bt.logging.warning({"sdio_status_sync_error": str(e), "event_id": event_id})
+            
             should_track = start_cutoff <= start_time <= end_cutoff
             key = self._tracked_key(state.config.code, game.game_id)
-            if should_track:
+            # Don't track finished games for odds - they're done
+            if should_track and not self._is_game_final(game):
                 self._ensure_tracked_event(state, game, event_id, start_time, home_id, away_id)
                 tracked += 1
             else:
                 self.tracked_events.pop(key, None)
+        
+        if status_updates > 0 or outcomes_recorded > 0:
+            bt.logging.info({
+                "sdio_lifecycle_sync": {
+                    "league": state.config.code.value,
+                    "status_updates": status_updates,
+                    "outcomes_recorded": outcomes_recorded,
+                }
+            })
         state.next_schedule_refresh = now + timedelta(minutes=state.config.schedule_refresh_minutes)
         return total_upserts
 
@@ -406,6 +463,187 @@ class SportsDataIngestor:
         if start_time.tzinfo is None:
             start_time = start_time.replace(tzinfo=timezone.utc)
         return event_id, start_time, home_id, away_id
+
+    # ------------------------------------------------------------------
+    # Event lifecycle sync (status + outcomes)
+    # ------------------------------------------------------------------
+    def _is_game_final(self, game: Game) -> bool:
+        """Check if game is in a final/completed state."""
+        if game.status is None:
+            return False
+        return game.status in (
+            GameStatus.FINAL,
+            GameStatus.FINAL_OT,
+            GameStatus.FINAL_SO,
+        )
+
+    def _game_status_to_event_status(self, game: Game) -> str:
+        """Map SDIO game status to our event status."""
+        if game.status is None:
+            return "scheduled"
+        mapping = {
+            GameStatus.SCHEDULED: "scheduled",
+            GameStatus.IN_PROGRESS: "in_play",
+            GameStatus.FINAL: "finished",
+            GameStatus.FINAL_OT: "finished",
+            GameStatus.FINAL_SO: "finished",
+            GameStatus.POSTPONED: "postponed",
+            GameStatus.CANCELED: "canceled",
+        }
+        return mapping.get(game.status, "scheduled")
+
+    async def _sync_event_status(self, event_id: int, game: Game, now: datetime) -> bool:
+        """Update event status from SDIO game status. Returns True if updated."""
+        new_status = self._game_status_to_event_status(game)
+        result = await self.database.write(
+            _UPDATE_EVENT_STATUS,
+            params={"event_id": event_id, "status": new_status},
+        )
+        if result > 0:
+            bt.logging.debug({
+                "sdio_event_status_updated": {
+                    "event_id": event_id,
+                    "game_id": game.game_id,
+                    "new_status": new_status,
+                }
+            })
+            return True
+        return False
+
+    async def _record_outcomes(
+        self,
+        event_id: int,
+        game: Game,
+        home_team_id: Optional[int],
+        away_team_id: Optional[int],
+    ) -> int:
+        """Record outcomes for all markets of a finished game. Returns count recorded."""
+        if game.home_score is None or game.away_score is None:
+            bt.logging.debug({
+                "sdio_outcome_skip": {
+                    "event_id": event_id,
+                    "reason": "scores_not_available",
+                }
+            })
+            return 0
+
+        home_score = game.home_score
+        away_score = game.away_score
+        settled_at = datetime.now(timezone.utc)
+
+        # Get all markets for this event
+        markets = await self.database.read(
+            _SELECT_MARKETS_FOR_EVENT,
+            params={"event_id": event_id},
+            mappings=True,
+        )
+
+        if not markets:
+            return 0
+
+        recorded = 0
+        for market in markets:
+            market_id = market["market_id"]
+            kind = market["kind"]
+            line = float(market["line"]) if market["line"] is not None else None
+            points_team_id = market["points_team_id"]
+
+            # Check if outcome already exists
+            existing = await self.database.read(
+                _CHECK_OUTCOME_EXISTS,
+                params={"market_id": market_id},
+            )
+            if existing:
+                continue
+
+            # Resolve result based on market type
+            result = self._resolve_market_result(
+                kind=kind,
+                line=line,
+                points_team_id=points_team_id,
+                home_team_id=home_team_id,
+                away_team_id=away_team_id,
+                home_score=home_score,
+                away_score=away_score,
+            )
+
+            if result is None:
+                bt.logging.debug({
+                    "sdio_outcome_unresolved": {
+                        "market_id": market_id,
+                        "kind": kind,
+                    }
+                })
+                continue
+
+            try:
+                await self.database.write(
+                    _UPSERT_OUTCOME,
+                    params={
+                        "market_id": market_id,
+                        "settled_at": settled_at,
+                        "result": result,
+                        "score_home": home_score,
+                        "score_away": away_score,
+                        "details": json.dumps({
+                            "source": "sdio_auto",
+                            "game_id": game.game_id,
+                            "game_status": game.status.value if game.status else None,
+                        }),
+                    },
+                )
+                recorded += 1
+                bt.logging.debug({
+                    "sdio_outcome_recorded": {
+                        "market_id": market_id,
+                        "kind": kind,
+                        "result": result,
+                        "score": f"{home_score}-{away_score}",
+                    }
+                })
+            except Exception as e:
+                bt.logging.warning({
+                    "sdio_outcome_error": {
+                        "market_id": market_id,
+                        "error": str(e),
+                    }
+                })
+
+        if recorded > 0:
+            bt.logging.info({
+                "sdio_outcomes_recorded": {
+                    "event_id": event_id,
+                    "game_id": game.game_id,
+                    "count": recorded,
+                    "score": f"{home_score}-{away_score}",
+                }
+            })
+
+        return recorded
+
+    def _resolve_market_result(
+        self,
+        kind: str,
+        line: Optional[float],
+        points_team_id: Optional[int],
+        home_team_id: Optional[int],
+        away_team_id: Optional[int],
+        home_score: int,
+        away_score: int,
+    ) -> Optional[str]:
+        """Resolve market result from scores."""
+        kind_upper = kind.upper() if kind else ""
+
+        if kind_upper == "MONEYLINE":
+            return resolve_moneyline_result(home_score, away_score)
+        elif kind_upper == "TOTAL" and line is not None:
+            return resolve_total_result(line, home_score, away_score)
+        elif kind_upper == "SPREAD" and line is not None:
+            # Determine if points_team is home or away
+            points_team_is_home = (points_team_id == home_team_id) if points_team_id else True
+            return resolve_spread_result(line, points_team_is_home, home_score, away_score)
+
+        return None
 
     def _ensure_tracked_event(
         self,

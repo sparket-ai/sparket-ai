@@ -185,6 +185,9 @@ class OddsScoreHandler:
         if not market_id or not side:
             return False
 
+        # Normalize side to uppercase for enum compatibility
+        side = str(side).upper()
+
         # Look up ground truth
         gt = await self._get_ground_truth(market_id, side)
         if gt is None:
@@ -232,6 +235,10 @@ class OddsScoreHandler:
         submission_id = row["submission_id"]
         market_id = row["market_id"]
         side = row["side"]
+
+        # Normalize side to uppercase for enum compatibility
+        if isinstance(side, str):
+            side = side.upper()
 
         # Look up ground truth
         gt = await self._get_ground_truth(market_id, side)

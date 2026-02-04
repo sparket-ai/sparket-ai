@@ -135,6 +135,215 @@ Miner                              Validator
 7. Validator scores submissions → SkillScore → emissions
 ```
 
+## Rate Limiting, Cooldowns & Blacklists
+
+Validators enforce rate limits to ensure fair access and prevent abuse. Understanding
+these limits is critical for building a reliable miner.
+
+### Rate Limit Architecture
+
+The validator uses a **three-tier** protection system:
+
+| Tier | Scope | Trigger | Consequence |
+|------|-------|---------|-------------|
+| **Rate Limit** | Per-request | Too many requests/second | Immediate 429 rejection |
+| **Cooldown** | Per-hotkey + Per-IP | Repeated failures | Temporary block (30s → 1h exponential) |
+| **Blacklist** | Permanent or 24h | Critical violations or persistent abuse | 403 rejection |
+
+### Rate Limits
+
+Requests are rate-limited at multiple levels:
+
+| Limit Type | Threshold | Window |
+|------------|-----------|--------|
+| Per-hotkey | 10 req/sec, 120 req/min | Rolling |
+| Per-IP | 50 req/sec, 500 req/min | Rolling |
+| Global | 200 req/sec, 5000 req/min | Rolling |
+
+**Best practice**: Submit no more than **1 request per second** per hotkey.
+
+### Cooldown Mechanics
+
+When you exceed thresholds or make invalid requests repeatedly, you enter a **cooldown**:
+
+1. **First cooldown**: 30 seconds
+2. **Each subsequent**: 2× previous (exponential backoff)
+3. **Maximum cooldown**: 1 hour
+
+Cooldowns apply separately to:
+- Your **hotkey** (your miner identity)
+- Your **IP address** (aggregate across all hotkeys)
+
+**What triggers cooldown:**
+- Invalid/missing push tokens
+- Malformed requests
+- Excessive rate limit hits
+- Submitting while already in cooldown
+
+### Fail2Ban (24-Hour Ban)
+
+If you **persistently ignore cooldowns** (keep submitting while blocked), you trigger
+an automatic 24-hour ban:
+
+| Threshold | Window | Ban Duration |
+|-----------|--------|--------------|
+| 20 cooldown violations | 1 hour | 24 hours |
+
+**What counts as a violation**: Any request rejected with `ip_cooldown` or `hotkey_cooldown`.
+
+**Avoid this by**: Implementing proper backoff in your miner. When you receive a 429
+response with `Retry-After` header, **wait that many seconds** before retrying.
+
+### Permanent Blacklist
+
+Critical security violations result in permanent blacklist:
+- Invalid signatures (spoofing attempts)
+- Nonce replay attacks
+- Scanner/probe requests (e.g., GET / with no bittensor headers)
+- Repeated unregistered hotkey submissions
+
+### Response Headers
+
+When rate-limited, the validator returns helpful headers:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 45
+Content-Type: application/json
+
+{
+  "success": false,
+  "error": "ip_cooldown",
+  "retry_after": 45,
+  "cooldown_type": "ip_cooldown",
+  "cooldown_remaining_seconds": 45,
+  "message": "You are in cooldown. Try again in 45 seconds"
+}
+```
+
+**Always check `Retry-After`** and implement exponential backoff.
+
+### Recommended Submission Cadence
+
+The scoring system rewards **consistent, well-timed submissions** over high frequency.
+Quality matters more than quantity.
+
+#### By League Type
+
+| League Type | Recommended Interval | Rationale |
+|-------------|---------------------|-----------|
+| **NFL/NBA/MLB** | Every 15-30 minutes | Markets move slowly, low game volume |
+| **Soccer (EPL, etc)** | Every 10-15 minutes | More games, moderate line movement |
+| **High-volume days** | Every 5-10 minutes | Multiple concurrent games |
+
+#### Batching Strategy
+
+**Do batch** submissions by league or time window:
+
+```python
+# Good: Batch all NFL markets together
+nfl_markets = get_markets_by_league("NFL")
+submit_odds_batch(nfl_markets)  # Single request with multiple markets
+
+# Good: Batch markets starting within same hour
+upcoming = get_markets_starting_within(hours=1)
+submit_odds_batch(upcoming)
+```
+
+**Don't** submit one market at a time:
+
+```python
+# Bad: One request per market (wastes rate limit budget)
+for market in markets:
+    submit_odds(market)  # 100 markets = 100 requests
+```
+
+#### Recommended Cycle
+
+```
+Every 15 minutes (900 seconds):
+  1. Fetch active markets from validator
+  2. Generate odds for all markets
+  3. Batch into groups of 50-100 markets
+  4. Submit each batch (1-2 requests total)
+  5. Log results, sleep until next cycle
+```
+
+The base miner uses this pattern by default with `SPARKET_BASE_MINER__BATCH_SIZE=50`.
+
+### Handling Rate Limit Responses
+
+Implement proper backoff in your submission client:
+
+```python
+import time
+from typing import Optional
+
+class SubmissionClient:
+    def __init__(self):
+        self.backoff_until: float = 0
+    
+    def submit(self, payload: dict) -> bool:
+        # Check if we're in backoff
+        now = time.time()
+        if now < self.backoff_until:
+            remaining = self.backoff_until - now
+            print(f"In backoff, waiting {remaining:.0f}s")
+            return False
+        
+        response = self._send_request(payload)
+        
+        if response.status_code == 429:
+            # Rate limited - extract retry delay
+            retry_after = int(response.headers.get("Retry-After", 60))
+            self.backoff_until = now + retry_after
+            print(f"Rate limited, backing off for {retry_after}s")
+            return False
+        
+        if response.status_code == 403:
+            # Blacklisted - serious problem
+            print("BLACKLISTED - check logs for reason")
+            return False
+        
+        # Success - reset backoff
+        self.backoff_until = 0
+        return True
+```
+
+### Monitoring Your Rate Limit Status
+
+Watch for these log patterns:
+
+**Healthy submission:**
+```json
+{"base_miner_odds_cycle": {"markets": 87, "batches": 2, "submitted": 87, "skipped": 0}}
+```
+
+**Rate limited (needs backoff adjustment):**
+```json
+{"submit_odds_rejected": {"error": "ip_cooldown", "retry_after": 45}}
+```
+
+**Approaching danger zone:**
+```json
+{"validator_backoff": {"seconds": 30, "reason": "repeated_rejections"}}
+```
+
+**Blacklisted (serious):**
+```json
+{"submit_odds_rejected": {"error": "ip_blacklisted", "message": "Your IP has been blacklisted"}}
+```
+
+### Summary: Do's and Don'ts
+
+| Do | Don't |
+|----|-------|
+| Batch markets into single requests | Submit one market per request |
+| Respect `Retry-After` headers | Retry immediately after rejection |
+| Use 15-minute cycles for most leagues | Submit every few seconds |
+| Implement exponential backoff | Ignore 429 responses |
+| Monitor submission success rate | Flood the validator hoping some get through |
+
 ## Before you begin
 
 

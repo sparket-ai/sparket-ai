@@ -17,6 +17,9 @@ class FailureType(str, Enum):
     # Rate limiting (low severity)
     RATE_LIMITED = "rate_limited"
     
+    # Cooldown violation - submitting while in cooldown (fail2ban trigger)
+    COOLDOWN_VIOLATION = "cooldown_violation"
+    
     # Registration/identity (high severity)
     NOT_REGISTERED = "not_registered"
     SIGNATURE_INVALID = "signature_invalid"
@@ -26,6 +29,7 @@ class FailureType(str, Enum):
     
     # Security threats (critical severity)
     NONCE_REPLAY = "nonce_replay"
+    SCANNER_REQUEST = "scanner_request"  # Probing/scanning (e.g., GET / with no synapse)
     
     # Generic catch-all (low severity)
     OTHER = "other"
@@ -36,6 +40,7 @@ CRITICAL_FAILURES: Tuple[str, ...] = (
     FailureType.NOT_REGISTERED.value,
     FailureType.SIGNATURE_INVALID.value,
     FailureType.NONCE_REPLAY.value,
+    FailureType.SCANNER_REQUEST.value,  # Immediate blacklist for scanners/probes
 )
 
 # Failure types that count toward cooldown
@@ -64,6 +69,12 @@ class CooldownConfig:
     ip_distinct_hotkey_threshold: int = 5  # Distinct failing hotkeys to flag IP
     ip_initial_cooldown_sec: int = 60  # IP cooldown duration
     ip_max_cooldown_sec: int = 3600  # Max IP cooldown
+    
+    # Fail2ban settings - ban miners who persistently ignore cooldowns
+    # If a miner keeps submitting while in cooldown, they get banned for 24 hours
+    fail2ban_violation_threshold: int = 20  # Cooldown violations before 24h ban
+    fail2ban_violation_window_sec: int = 3600  # Window to count violations (1 hour)
+    fail2ban_duration_sec: int = 86400  # Ban duration (24 hours)
     
     # Permanent blacklist thresholds
     # NOTE: Only CRITICAL failures (spoofing, invalid signatures, nonce replay) 

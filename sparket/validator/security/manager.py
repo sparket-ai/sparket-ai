@@ -28,6 +28,7 @@ from .config import (
     RateLimitConfig,
     SecurityConfig,
 )
+from .iptables import get_iptables_manager
 
 
 @dataclass
@@ -38,11 +39,21 @@ class FailureRecord:
     cooldown_count: int = 0  # Number of cooldowns triggered
     cooldown_until: float = 0.0  # Timestamp when cooldown ends
     last_failure: float = 0.0
+    cooldown_violations: List[float] = field(default_factory=list)  # Timestamps of cooldown violations
     
     def add_failure(self, failure_type: str) -> None:
         now = time.time()
         self.failures.append((now, failure_type))
         self.last_failure = now
+    
+    def add_cooldown_violation(self) -> None:
+        """Record a cooldown violation (submitting while in cooldown)."""
+        self.cooldown_violations.append(time.time())
+    
+    def count_cooldown_violations(self, window_sec: float) -> int:
+        """Count cooldown violations in the given window."""
+        cutoff = time.time() - window_sec
+        return sum(1 for ts in self.cooldown_violations if ts > cutoff)
     
     def count_recent(self, window_sec: float) -> int:
         cutoff = time.time() - window_sec
@@ -55,6 +66,7 @@ class FailureRecord:
     def cleanup(self, retention_sec: float) -> None:
         cutoff = time.time() - retention_sec
         self.failures = [(ts, ft) for ts, ft in self.failures if ts > cutoff]
+        self.cooldown_violations = [ts for ts in self.cooldown_violations if ts > cutoff]
 
 
 @dataclass
@@ -97,12 +109,23 @@ class SecurityManager:
         # Per-IP tracking
         self._ip_records: Dict[str, IPRecord] = defaultdict(IPRecord)
         
-        # Permanent blacklist (loaded from DB, cached in memory)
-        self._blacklist_hotkeys: Set[str] = set()
-        self._blacklist_ips: Set[str] = set()
+        # Blacklist (loaded from DB, cached in memory)
+        # Stores {identifier: expires_at_timestamp or None for permanent}
+        self._blacklist_hotkeys: Dict[str, Optional[float]] = {}
+        self._blacklist_ips: Dict[str, Optional[float]] = {}
         
         # Timestamps for periodic cleanup
         self._last_cleanup = time.time()
+        
+        # Initialize iptables manager for network-level blocking (if root)
+        try:
+            iptables = get_iptables_manager()
+            if iptables.initialize():
+                bt.logging.info({"security_manager": "iptables_enabled"})
+            else:
+                bt.logging.debug({"security_manager": "iptables_disabled", "reason": "not_root_or_unavailable"})
+        except Exception as e:
+            bt.logging.debug({"security_manager": "iptables_init_error", "error": str(e)})
     
     # -------------------------------------------------------------------------
     # Metagraph Integration
@@ -143,9 +166,9 @@ class SecurityManager:
     # -------------------------------------------------------------------------
     
     async def load_blacklist_from_db(self) -> None:
-        """Load permanent blacklist from database into memory.
+        """Load blacklist from database into memory.
         
-        Called on validator startup.
+        Called on validator startup. Loads both permanent and time-limited bans.
         """
         if self.database is None:
             bt.logging.warning({"security_manager": "no_database_for_blacklist"})
@@ -155,7 +178,7 @@ class SecurityManager:
             now = datetime.now(timezone.utc)
             rows = await self.database.read(
                 text("""
-                    SELECT identifier, identifier_type
+                    SELECT identifier, identifier_type, expires_at
                     FROM security_blacklist
                     WHERE expires_at IS NULL OR expires_at > :now
                 """),
@@ -168,10 +191,15 @@ class SecurityManager:
                 self._blacklist_ips.clear()
                 
                 for row in rows:
+                    # Convert expires_at to timestamp (None for permanent)
+                    expires_ts = None
+                    if row["expires_at"] is not None:
+                        expires_ts = row["expires_at"].timestamp()
+                    
                     if row["identifier_type"] == "hotkey":
-                        self._blacklist_hotkeys.add(row["identifier"])
+                        self._blacklist_hotkeys[row["identifier"]] = expires_ts
                     elif row["identifier_type"] == "ip":
-                        self._blacklist_ips.add(row["identifier"])
+                        self._blacklist_ips[row["identifier"]] = expires_ts
             
             bt.logging.info({
                 "security_manager": "blacklist_loaded",
@@ -193,24 +221,51 @@ class SecurityManager:
         failure_count: int = 0,
         expires_at: Optional[datetime] = None,
     ) -> None:
-        """Add an identifier to the permanent blacklist.
+        """Add an identifier to the blacklist.
         
         Updates both memory cache and database.
+        
+        Args:
+            identifier: The hotkey or IP to blacklist
+            identifier_type: Either "hotkey" or "ip"
+            reason: Human-readable reason for the ban
+            failure_type: The type of failure that triggered this
+            failure_count: Number of failures
+            expires_at: When the ban expires (None for permanent)
         """
+        # Convert expires_at to timestamp for memory storage
+        expires_ts = expires_at.timestamp() if expires_at else None
+        
         # Update memory immediately
         with self._lock:
             if identifier_type == "hotkey":
-                self._blacklist_hotkeys.add(identifier)
+                self._blacklist_hotkeys[identifier] = expires_ts
             elif identifier_type == "ip":
-                self._blacklist_ips.add(identifier)
+                self._blacklist_ips[identifier] = expires_ts
         
+        # Log with expiry info
         bt.logging.warning({
             "security_blacklist_add": {
                 "identifier": identifier[:16] + "..." if len(identifier) > 16 else identifier,
                 "type": identifier_type,
                 "reason": reason,
+                "expires": expires_at.isoformat() if expires_at else "never",
             }
         })
+        
+        # Block at iptables level for IPs (if running as root)
+        # This provides immediate network-level blocking
+        if identifier_type == "ip":
+            try:
+                iptables = get_iptables_manager()
+                # Calculate duration from expiry (default 24h for permanent bans too)
+                duration = 86400  # default 24 hours
+                if expires_at is not None:
+                    duration = max(1, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+                iptables.block_ip(identifier, duration_sec=duration)
+            except Exception as e:
+                # Don't fail if iptables blocking fails - app-level blocking is primary
+                bt.logging.debug({"iptables_block_error": str(e)})
         
         # Persist to database asynchronously
         if self.database is None:
@@ -246,13 +301,32 @@ class SecurityManager:
     def is_blacklisted(self, hotkey: Optional[str], ip: Optional[str]) -> Tuple[bool, Optional[str]]:
         """Check if hotkey or IP is blacklisted.
         
+        Handles both permanent and time-limited bans.
+        Expired bans are cleaned up during this check.
+        
         Returns: (is_blacklisted, reason)
         """
+        now = time.time()
+        
         with self._lock:
+            # Check hotkey blacklist
             if hotkey and hotkey in self._blacklist_hotkeys:
-                return True, "hotkey_blacklisted"
+                expires_ts = self._blacklist_hotkeys[hotkey]
+                if expires_ts is None or expires_ts > now:
+                    return True, "hotkey_blacklisted"
+                else:
+                    # Expired, remove from memory
+                    del self._blacklist_hotkeys[hotkey]
+            
+            # Check IP blacklist
             if ip and ip in self._blacklist_ips:
-                return True, "ip_blacklisted"
+                expires_ts = self._blacklist_ips[ip]
+                if expires_ts is None or expires_ts > now:
+                    return True, "ip_blacklisted"
+                else:
+                    # Expired, remove from memory
+                    del self._blacklist_ips[ip]
+        
         return False, None
     
     # -------------------------------------------------------------------------
@@ -305,6 +379,89 @@ class SecurityManager:
         
         record.cooldown_until = time.time() + duration
         return duration
+    
+    # -------------------------------------------------------------------------
+    # Fail2Ban - 24h ban for persistent cooldown violators
+    # -------------------------------------------------------------------------
+    
+    async def record_cooldown_violation(
+        self,
+        hotkey: Optional[str],
+        ip: Optional[str],
+    ) -> Optional[str]:
+        """Record a cooldown violation (submitting while in cooldown).
+        
+        If violations exceed threshold, trigger a 24-hour ban.
+        
+        Returns:
+            Ban reason if a ban was triggered, None otherwise
+        """
+        if not self.config.enforce_cooldowns:
+            return None
+        
+        cfg = self.config.cooldown
+        ban_triggered = None
+        ban_identifier = None
+        ban_type = None
+        violation_count = 0
+        
+        with self._lock:
+            # Record hotkey violation - use defaultdict to auto-create record
+            if hotkey:
+                record = self._hotkey_records[hotkey]
+                record.add_cooldown_violation()
+                violation_count = record.count_cooldown_violations(cfg.fail2ban_violation_window_sec)
+                
+                if violation_count >= cfg.fail2ban_violation_threshold:
+                    ban_triggered = f"fail2ban: {violation_count} cooldown violations in {cfg.fail2ban_violation_window_sec}s"
+                    ban_identifier = hotkey
+                    ban_type = "hotkey"
+            
+            # Record IP violation (separate tracking) - use defaultdict to auto-create record
+            if ip:
+                ip_record = self._ip_records[ip]
+                ip_record.add_cooldown_violation()
+                ip_violation_count = ip_record.count_cooldown_violations(cfg.fail2ban_violation_window_sec)
+                
+                # IP gets banned if it exceeds threshold (catches hotkey cycling)
+                if ip_violation_count >= cfg.fail2ban_violation_threshold and not ban_triggered:
+                    ban_triggered = f"fail2ban: IP {ip_violation_count} cooldown violations in {cfg.fail2ban_violation_window_sec}s"
+                    ban_identifier = ip
+                    ban_type = "ip"
+                    violation_count = ip_violation_count
+        
+        # Trigger 24-hour ban if threshold exceeded
+        if ban_triggered and ban_identifier and ban_type:
+            # Calculate expiry time (24 hours from now)
+            expires_at = datetime.now(timezone.utc).replace(microsecond=0)
+            expires_at = expires_at.replace(
+                hour=expires_at.hour,
+                minute=expires_at.minute,
+                second=expires_at.second + cfg.fail2ban_duration_sec
+            )
+            # Handle overflow
+            from datetime import timedelta
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=cfg.fail2ban_duration_sec)
+            
+            bt.logging.warning(
+                f"{LogColors.MINER_LABEL} fail2ban_triggered: "
+                f"{ban_type}={ban_identifier[:16] + '...' if len(ban_identifier) > 16 else ban_identifier}, "
+                f"violations={violation_count}, "
+                f"ban_duration={cfg.fail2ban_duration_sec}s (24h)"
+            )
+            
+            await self.add_to_blacklist(
+                identifier=ban_identifier,
+                identifier_type=ban_type,
+                reason=ban_triggered,
+                failure_type=FailureType.COOLDOWN_VIOLATION.value,
+                failure_count=violation_count,
+                expires_at=expires_at,
+            )
+            
+            return ban_triggered
+        
+        return None
     
     # -------------------------------------------------------------------------
     # Failure Recording
@@ -429,7 +586,7 @@ class SecurityManager:
     # -------------------------------------------------------------------------
     
     def _maybe_cleanup(self) -> None:
-        """Periodic cleanup of stale records."""
+        """Periodic cleanup of stale records and expired bans."""
         now = time.time()
         if now - self._last_cleanup < self.config.cooldown.cleanup_interval_sec:
             return
@@ -442,7 +599,7 @@ class SecurityManager:
             stale_hotkeys = []
             for hotkey, record in self._hotkey_records.items():
                 record.cleanup(retention)
-                if not record.failures and record.cooldown_until <= now:
+                if not record.failures and not record.cooldown_violations and record.cooldown_until <= now:
                     stale_hotkeys.append(hotkey)
             
             for hotkey in stale_hotkeys:
@@ -452,17 +609,34 @@ class SecurityManager:
             stale_ips = []
             for ip, record in self._ip_records.items():
                 record.cleanup(retention)
-                if not record.failures and record.cooldown_until <= now:
+                if not record.failures and not record.cooldown_violations and record.cooldown_until <= now:
                     stale_ips.append(ip)
             
             for ip in stale_ips:
                 del self._ip_records[ip]
             
-            if stale_hotkeys or stale_ips:
+            # Clean expired blacklist entries
+            expired_bl_hotkeys = [
+                hk for hk, exp in self._blacklist_hotkeys.items()
+                if exp is not None and exp <= now
+            ]
+            for hk in expired_bl_hotkeys:
+                del self._blacklist_hotkeys[hk]
+            
+            expired_bl_ips = [
+                ip for ip, exp in self._blacklist_ips.items()
+                if exp is not None and exp <= now
+            ]
+            for ip in expired_bl_ips:
+                del self._blacklist_ips[ip]
+            
+            if stale_hotkeys or stale_ips or expired_bl_hotkeys or expired_bl_ips:
                 bt.logging.debug({
                     "security_manager": "cleanup",
                     "stale_hotkeys": len(stale_hotkeys),
                     "stale_ips": len(stale_ips),
+                    "expired_bans_hotkeys": len(expired_bl_hotkeys),
+                    "expired_bans_ips": len(expired_bl_ips),
                 })
     
     # -------------------------------------------------------------------------
