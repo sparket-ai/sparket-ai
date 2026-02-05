@@ -93,17 +93,12 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
         )
         
         if requires_token and comms is not None and getattr(comms, "require_token", False):
-            # Ensure step is an integer (could be numpy array from state loading)
-            step_val = validator.step
-            step_int = int(step_val) if hasattr(step_val, '__int__') else 0
-            
-            if not comms.verify_token(token=token, step=step_int):
-                current_epoch = step_int // comms.step_rotation
+            if not comms.verify_token(token=token):
                 hotkey_short = miner_hotkey[:16] + "..." if len(miner_hotkey) > 16 else miner_hotkey
                 token_preview = token[:8] + "..." if token else "none"
                 bt.logging.warning(
                     f"{LogColors.MINER_LABEL} token_invalid: hotkey={hotkey_short}, "
-                    f"token={token_preview}, step={step_int}, epoch={current_epoch}"
+                    f"token={token_preview}"
                 )
                 # Record failure for cooldown tracking
                 failure_type = "token_missing" if not token else "token_invalid"

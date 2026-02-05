@@ -312,17 +312,17 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.info({"validator_init": {"step": "initializing_comms"}})
             proxy_url = getattr(getattr(self.app_config, "validator", None), "proxy_url", None)
             require_token = bool(getattr(getattr(self.app_config, "validator", None), "require_push_token", True))
-            step_rotation = int(getattr(getattr(self.app_config, "validator", None), "token_rotation_steps", 10))
+            token_rotation_sec = int(getattr(getattr(self.app_config, "validator", None), "token_rotation_seconds", 3600))
             self.comms = ValidatorComms(
                 proxy_url=proxy_url,
                 require_token=require_token,
-                step_rotation=step_rotation,
+                token_rotation_seconds=token_rotation_sec,
             )
             bt.logging.info({
                 "validator_init": {
                     "step": "comms_initialized",
                     "require_token": require_token,
-                    "step_rotation": step_rotation,
+                    "token_rotation_seconds": token_rotation_sec,
                 }
             })
 
@@ -583,16 +583,16 @@ class BaseValidatorNeuron(BaseNeuron):
             # Build endpoint info
             endpoint = self.comms.advertised_endpoint(axon=self.axon)
             
-            # Get current token
+            # Get current token (time-based rotation)
+            token = self.comms.current_token()
             step = int(self.step) if hasattr(self.step, '__int__') else 0
-            token = self.comms.current_token(step=step)
             
             # Build payload
             payload = {
                 **endpoint,
                 "token": token,
                 "hotkey": self.wallet.hotkey.ss58_address,
-                "step": step,
+                "step": step,  # Still included for miner reference
             }
             
             # Create synapse

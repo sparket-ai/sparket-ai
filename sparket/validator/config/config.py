@@ -27,10 +27,10 @@ class ValidatorSettings(BaseModel):
         default=True,
         description="Require authentication token for miner odds/outcome pushes"
     )
-    token_rotation_steps: int = Field(
-        default=10,
-        ge=1,
-        description="Number of validator steps before rotating the push token"
+    token_rotation_seconds: int = Field(
+        default=3600,
+        ge=60,
+        description="Seconds between push token rotations (default: 1 hour)"
     )
     proxy_url: str | None = Field(
         default=None,

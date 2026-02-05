@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -433,14 +433,6 @@ class SecurityManager:
         # Trigger 24-hour ban if threshold exceeded
         if ban_triggered and ban_identifier and ban_type:
             # Calculate expiry time (24 hours from now)
-            expires_at = datetime.now(timezone.utc).replace(microsecond=0)
-            expires_at = expires_at.replace(
-                hour=expires_at.hour,
-                minute=expires_at.minute,
-                second=expires_at.second + cfg.fail2ban_duration_sec
-            )
-            # Handle overflow
-            from datetime import timedelta
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=cfg.fail2ban_duration_sec)
             
             bt.logging.warning(

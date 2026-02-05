@@ -13,36 +13,49 @@ class ValidatorComms:
     """
     Manages validator-side announcement details and a rotating token for miner pushes.
     - Builds the advertised endpoint (proxy_url if set, else host/port from axon)
-    - Maintains an HMAC token rotated every N steps
+    - Maintains an HMAC token rotated on a time basis (default: 1 hour)
     - Verifies presented tokens from miners
     """
 
-    def __init__(self, *, proxy_url: Optional[str], require_token: bool, step_rotation: int = 10) -> None:
+    def __init__(
+        self,
+        *,
+        proxy_url: Optional[str],
+        require_token: bool,
+        token_rotation_seconds: int = 3600,
+    ) -> None:
         self.proxy_url = proxy_url
         self.require_token = require_token
-        self.step_rotation = max(1, int(step_rotation))
+        self.token_rotation_seconds = max(60, int(token_rotation_seconds))  # minimum 1 minute
         # Secret key for HMAC; generated at runtime. Can be overridden via env for testing.
         env_key = os.getenv("SPARKET_VALIDATOR_PUSH_SECRET")
         self._secret = env_key.encode("utf-8") if env_key else secrets.token_bytes(32)
-        self._last_epoch_step: Optional[int] = None
+        self._last_epoch: Optional[int] = None
         self._cached_token: Optional[str] = None
 
-    def current_token(self, *, step: int) -> str:
-        epoch = step // self.step_rotation
+    def _current_epoch(self) -> int:
+        """Get current time-based epoch."""
+        return int(time.time()) // self.token_rotation_seconds
+
+    def current_token(self) -> str:
+        """Get the current valid token (time-based rotation)."""
+        epoch = self._current_epoch()
         # Cache per epoch
-        if self._last_epoch_step != epoch or not self._cached_token:
+        if self._last_epoch != epoch or not self._cached_token:
             msg = str(epoch).encode("utf-8")
             self._cached_token = hmac.new(self._secret, msg, digestmod="sha256").hexdigest()
-            self._last_epoch_step = epoch
+            self._last_epoch = epoch
         return self._cached_token
 
-    def verify_token(self, *, token: Optional[str], step: int) -> bool:
+    def verify_token(self, *, token: Optional[str]) -> bool:
+        """Verify a token is valid for current or previous epoch."""
         if not self.require_token:
             return True
         if not token:
             return False
-        # Accept current or previous epoch to allow minor clock/step drift
-        for epoch in (step // self.step_rotation, max(0, step // self.step_rotation - 1)):
+        # Accept current or previous epoch to allow clock drift between validator/miner
+        current_epoch = self._current_epoch()
+        for epoch in (current_epoch, max(0, current_epoch - 1)):
             expect = hmac.new(self._secret, str(epoch).encode("utf-8"), digestmod="sha256").hexdigest()
             if hmac.compare_digest(expect, token):
                 return True
