@@ -30,6 +30,7 @@ dependencies = [
     "psutil>=7.2.1",
     "scipy>=1.15.3",
     "aiohttp>=3.13.3",
+    "prometheus_client>=0.20.0",
 ]
 
 [project.scripts]

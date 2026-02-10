@@ -56,6 +56,8 @@ class LedgerHTTPServer:
         app.router.add_get("/ledger/deltas", self._handle_list_deltas)
         app.router.add_get("/ledger/deltas/{delta_id}", self._handle_get_delta)
         app.router.add_post("/ledger/recompute", self._handle_recompute)
+        # Prometheus metrics endpoint (no auth - operational data only)
+        app.router.add_get("/metrics", self._handle_metrics)
         return app
 
     async def start(self) -> None:
@@ -224,6 +226,20 @@ class LedgerHTTPServer:
             "epoch": cp.manifest.checkpoint_epoch,
             "status": "ok",
         })
+
+
+    # -- Prometheus metrics --
+
+    async def _handle_metrics(self, request: web.Request) -> web.Response:
+        """Serve Prometheus metrics in text exposition format. No auth required."""
+        from prometheus_client import generate_latest
+        from sparket.validator.observability.metrics import REGISTRY
+
+        body = generate_latest(REGISTRY)
+        return web.Response(
+            body=body,
+            content_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
 
 __all__ = ["LedgerHTTPServer"]

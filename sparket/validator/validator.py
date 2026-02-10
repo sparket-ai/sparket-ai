@@ -106,6 +106,9 @@ class BaseValidatorNeuron(BaseNeuron):
         self._sdio_ingest_running: bool = False
         self._sdio_ingest_task: asyncio.Task | None = None
 
+        # Observability: track process start time for uptime gauge
+        self._start_time: float = time.time()
+
         # Initialize validator components (database, security_manager, etc.)
         # MUST happen before serve_axon() so security middleware can be injected
         self.initialize_components()
@@ -312,9 +315,26 @@ class BaseValidatorNeuron(BaseNeuron):
                 bt.logging.error({"validator_startup_db_error": str(e)})
                 raise
 
+            # Initialize observability syncer (if enabled)
+            self._syncer = None
+            try:
+                obs_cfg = getattr(getattr(self.app_config, "core", None), "observability", None)
+                if obs_cfg and getattr(obs_cfg, "sync_enabled", False):
+                    from sparket.validator.observability.syncer import DataSyncer
+
+                    self._syncer = DataSyncer(
+                        api_url=getattr(obs_cfg, "sync_api_url", ""),
+                        api_key=getattr(obs_cfg, "sync_api_key", ""),
+                        database=self.dbm,
+                        timeout=getattr(obs_cfg, "sync_timeout_seconds", 10),
+                    )
+                    bt.logging.info({"validator_init": {"syncer": "enabled"}})
+            except Exception as e:
+                bt.logging.warning({"validator_init": {"syncer_init_error": str(e)}})
+
             # Initialize handlers
             bt.logging.info({"validator_init": {"step": "initializing_handlers"}})
-            self.handlers = Handlers(self.dbm)
+            self.handlers = Handlers(self.dbm, syncer=self._syncer)
             bt.logging.info({"validator_init": {"step": "handlers_initialized"}})
 
             # Initialize ValidatorComms for token management
@@ -846,6 +866,15 @@ class BaseValidatorNeuron(BaseNeuron):
             while True:
                 loop_iter += 1
                 try:
+                    from sparket.validator.observability.metrics import (
+                        STEP_TOTAL, STEP_DURATION, UPTIME,
+                    )
+                    import time as _obs_time
+
+                    STEP_TOTAL.inc()
+                    if hasattr(self, "_start_time"):
+                        UPTIME.set(_obs_time.time() - self._start_time)
+
                     timers = getattr(getattr(self.app_config, "core", None), "timers", None)
                     step_target = getattr(timers, "step_target_seconds", 12) if timers is not None else 12
                     timeouts = resolve_loop_timeouts(step_target)
@@ -864,9 +893,10 @@ class BaseValidatorNeuron(BaseNeuron):
 
                     bt.logging.debug({"validator_loop": {"phase": "connection_push_start"}})
                     try:
-                        self.loop.run_until_complete(
-                            asyncio.wait_for(self._push_connection_info(), timeout=timeouts["forward"])
-                        )
+                        with STEP_DURATION.labels(phase="connection_push").time():
+                            self.loop.run_until_complete(
+                                asyncio.wait_for(self._push_connection_info(), timeout=timeouts["forward"])
+                            )
                     except asyncio.TimeoutError:
                         bt.logging.warning({"validator_loop": {"phase": "connection_push_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "connection_push_complete"}})
@@ -898,9 +928,44 @@ class BaseValidatorNeuron(BaseNeuron):
 
                     bt.logging.debug({"validator_loop": {"phase": "scoring_start"}})
                     try:
-                        if getattr(self, "scoring_worker_enabled", False):
-                            fallback_enabled = bool(getattr(self, "scoring_worker_fallback", True))
-                            if fallback_enabled and not worker_healthy:
+                        with STEP_DURATION.labels(phase="scoring").time():
+                            if getattr(self, "scoring_worker_enabled", False):
+                                fallback_enabled = bool(getattr(self, "scoring_worker_fallback", True))
+                                if fallback_enabled and not worker_healthy:
+                                    self.loop.run_until_complete(
+                                        asyncio.wait_for(
+                                            run_main_scoring_if_due_async(
+                                                step=self.step,
+                                                app_config=self.app_config,
+                                                handlers=self.handlers,
+                                                validator=self,
+                                                emit_weights=False,
+                                            ),
+                                            timeout=timeouts["scoring"],
+                                        )
+                                    )
+                                else:
+                                    self.loop.run_until_complete(
+                                        asyncio.wait_for(
+                                            run_snapshot_pipeline_if_due_async(
+                                                step=self.step,
+                                                app_config=self.app_config,
+                                                handlers=self.handlers,
+                                            ),
+                                            timeout=timeouts["scoring"],
+                                        )
+                                    )
+                                    self.loop.run_until_complete(
+                                        asyncio.wait_for(
+                                            schedule_scoring_work_if_due_async(
+                                                step=self.step,
+                                                app_config=self.app_config,
+                                                database=self.dbm,
+                                            ),
+                                            timeout=timeouts["scoring"],
+                                        )
+                                    )
+                            else:
                                 self.loop.run_until_complete(
                                     asyncio.wait_for(
                                         run_main_scoring_if_due_async(
@@ -908,45 +973,11 @@ class BaseValidatorNeuron(BaseNeuron):
                                             app_config=self.app_config,
                                             handlers=self.handlers,
                                             validator=self,
-                                            emit_weights=False,  # Base neuron handles weight cadence
+                                            emit_weights=False,
                                         ),
                                         timeout=timeouts["scoring"],
                                     )
                                 )
-                            else:
-                                self.loop.run_until_complete(
-                                    asyncio.wait_for(
-                                        run_snapshot_pipeline_if_due_async(
-                                            step=self.step,
-                                            app_config=self.app_config,
-                                            handlers=self.handlers,
-                                        ),
-                                        timeout=timeouts["scoring"],
-                                    )
-                                )
-                                self.loop.run_until_complete(
-                                    asyncio.wait_for(
-                                        schedule_scoring_work_if_due_async(
-                                            step=self.step,
-                                            app_config=self.app_config,
-                                            database=self.dbm,
-                                        ),
-                                        timeout=timeouts["scoring"],
-                                    )
-                                )
-                        else:
-                            self.loop.run_until_complete(
-                                asyncio.wait_for(
-                                    run_main_scoring_if_due_async(
-                                        step=self.step,
-                                        app_config=self.app_config,
-                                        handlers=self.handlers,
-                                        validator=self,
-                                        emit_weights=False,  # Base neuron handles weight cadence
-                                    ),
-                                    timeout=timeouts["scoring"],
-                                )
-                            )
                     except asyncio.TimeoutError:
                         bt.logging.warning({"validator_loop": {"phase": "scoring_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "scoring_complete"}})
@@ -958,15 +989,16 @@ class BaseValidatorNeuron(BaseNeuron):
 
                     bt.logging.debug({"validator_loop": {"phase": "outcome_process_start"}})
                     try:
-                        self.loop.run_until_complete(
-                            asyncio.wait_for(
-                                run_outcome_processing_if_due(
-                                    validator=self,
-                                    database=self.dbm,
-                                ),
-                                timeout=timeouts["outcome"],
+                        with STEP_DURATION.labels(phase="outcome_process").time():
+                            self.loop.run_until_complete(
+                                asyncio.wait_for(
+                                    run_outcome_processing_if_due(
+                                        validator=self,
+                                        database=self.dbm,
+                                    ),
+                                    timeout=timeouts["outcome"],
+                                )
                             )
-                        )
                     except asyncio.TimeoutError:
                         bt.logging.warning({"validator_loop": {"phase": "outcome_process_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "outcome_process_complete"}})
@@ -975,28 +1007,48 @@ class BaseValidatorNeuron(BaseNeuron):
 
                     bt.logging.debug({"validator_loop": {"phase": "cleanup_start"}})
                     try:
-                        self.loop.run_until_complete(
-                            asyncio.wait_for(
-                                run_cleanup_if_due(validator=self, database=self.dbm),
-                                timeout=timeouts["cleanup"],
+                        with STEP_DURATION.labels(phase="cleanup").time():
+                            self.loop.run_until_complete(
+                                asyncio.wait_for(
+                                    run_cleanup_if_due(validator=self, database=self.dbm),
+                                    timeout=timeouts["cleanup"],
+                                )
                             )
-                        )
                     except asyncio.TimeoutError:
                         bt.logging.warning({"validator_loop": {"phase": "cleanup_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "cleanup_complete"}})
 
                     bt.logging.debug({"validator_loop": {"phase": "sync_start"}})
-                    self.sync()
-                    # Sync miners to database after metagraph sync
-                    try:
-                        self.loop.run_until_complete(
-                            self.handlers.sync_metagraph_handler.run_async(self, set_weights=False)
-                        )
-                    except Exception as e:
-                        bt.logging.warning({"miner_db_sync_error": str(e)})
+                    with STEP_DURATION.labels(phase="sync").time():
+                        self.sync()
+                        # Sync miners to database after metagraph sync
+                        try:
+                            self.loop.run_until_complete(
+                                self.handlers.sync_metagraph_handler.run_async(self, set_weights=False)
+                            )
+                        except Exception as e:
+                            bt.logging.warning({"miner_db_sync_error": str(e)})
                     bt.logging.debug({"validator_loop": {"phase": "sync_complete"}})
 
                     self.step += 1
+
+                    # Observability: push heartbeat every N steps
+                    try:
+                        obs_cfg = getattr(getattr(self.app_config, "core", None), "observability", None)
+                        hb_interval = getattr(obs_cfg, "heartbeat_interval_steps", 5) if obs_cfg else 5
+                        if self._syncer and self._syncer.enabled and self.step % hb_interval == 0:
+                            _hk = getattr(getattr(self, "wallet", None), "hotkey", None)
+                            _hk_addr = getattr(_hk, "ss58_address", str(_hk or ""))
+                            _uptime = _obs_time.time() - self._start_time
+                            self.loop.run_until_complete(
+                                asyncio.wait_for(
+                                    self._syncer.push_heartbeat(_hk_addr, self.step, _uptime),
+                                    timeout=5,
+                                )
+                            )
+                    except Exception:
+                        pass  # never block the loop for heartbeat
+
                     # Use async sleep to allow event loop to process other tasks
                     self.loop.run_until_complete(asyncio.sleep(30))
 

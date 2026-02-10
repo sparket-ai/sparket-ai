@@ -109,12 +109,19 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
 
         # Route: ODDS_PUSH
         if synapse_type == SparketSynapseType.ODDS_PUSH.value:
-            event = await validator.handlers.ingest_odds_handler.handle_synapse(synapse)
+            from sparket.validator.observability.metrics import (
+                SUBMISSIONS_RECEIVED, SUBMISSIONS_ACCEPTED, SUBMISSIONS_REJECTED,
+                SUBMISSION_PROCESSING,
+            )
+            SUBMISSIONS_RECEIVED.inc()
+            with SUBMISSION_PROCESSING.time():
+                event = await validator.handlers.ingest_odds_handler.handle_synapse(synapse)
             if event is not None:
                 await validator.handlers.odds_score_handler.score_event(event)
-                # Set success response
+                SUBMISSIONS_ACCEPTED.inc()
                 synapse.payload = {"success": True, "accepted": True}
             else:
+                SUBMISSIONS_REJECTED.inc()
                 synapse.payload = {"success": True, "accepted": False, "message": "No valid submissions"}
             return event
 

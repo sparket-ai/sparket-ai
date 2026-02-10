@@ -190,6 +190,18 @@ class RuntimeSettings(BaseModel):
         return _data_dir(self.test_mode)
 
 
+class ObservabilitySettings(BaseModel):
+    """Controls Prometheus instrumentation and dashboard data sync."""
+
+    enabled: bool = False
+    prometheus_enabled: bool = True
+    sync_enabled: bool = False
+    sync_api_url: str = ""
+    sync_api_key: str = ""
+    sync_timeout_seconds: int = 10
+    heartbeat_interval_steps: int = 5
+
+
 class TimerSettings(BaseModel):
     # MVP timing by steps; validator loop targets ~12s per step
     step_target_seconds: int = 12
@@ -312,6 +324,7 @@ class Settings(BaseSettings):
     timers: TimerSettings = Field(default_factory=TimerSettings)
     axon: AxonSettings = Field(default_factory=AxonSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     # Optional label for clarity/logging (validator/miner)
     role: Optional[Literal["validator", "miner", "base"]] = None
