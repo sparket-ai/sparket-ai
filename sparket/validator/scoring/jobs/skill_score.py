@@ -71,6 +71,7 @@ _UPDATE_SKILL_SCORE = text(
         forecast_dim = :forecast_dim,
         econ_dim = :econ_dim,
         info_dim = :info_dim,
+        skill_dim = :skill_dim,
         skill_score = :skill_score,
         score_version = score_version + 1
     WHERE miner_id = :miner_id
@@ -226,6 +227,7 @@ class SkillScoreJob(ScoringJob):
                     "forecast_dim": float(forecast_dim[i]),
                     "econ_dim": float(econ_dim[i]),
                     "info_dim": float(info_dim[i]),
+                    "skill_dim": float(skill_dim[i]),
                     "skill_score": float(skill_score[i]),
                 },
             )

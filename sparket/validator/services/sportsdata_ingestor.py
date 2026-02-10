@@ -59,6 +59,25 @@ _CHECK_OUTCOME_EXISTS = text("""
     SELECT 1 FROM outcome WHERE market_id = :market_id LIMIT 1
 """)
 
+_UPSERT_SPORTSBOOK = text("""
+    INSERT INTO sportsbook (provider_id, code, name, is_sharp, active)
+    VALUES (:provider_id, :code, :name, false, true)
+    ON CONFLICT (code) DO NOTHING
+    RETURNING sportsbook_id
+""")
+
+_SELECT_SPORTSBOOK_CODES = text("""
+    SELECT code FROM sportsbook WHERE provider_id = :provider_id
+""")
+
+_SEED_SPORTSBOOK_BIAS = text("""
+    INSERT INTO sportsbook_bias (sportsbook_id, sport_id, market_kind, bias_factor, variance, sample_count, version)
+    SELECT :sportsbook_id, s.sport_id, mk.kind, 1.0, 0.01, 0, 1
+    FROM sport s
+    CROSS JOIN (VALUES ('MONEYLINE'), ('SPREAD'), ('TOTAL')) AS mk(kind)
+    ON CONFLICT DO NOTHING
+""")
+
 
 @dataclass
 class TrackedEvent:
@@ -341,10 +360,11 @@ class SportsDataIngestor:
                 updated = await self._sync_event_status(event_id, game, now)
                 if updated:
                     status_updates += 1
-                    # If game is final/finished, record outcomes
-                    if self._is_game_final(game):
-                        recorded = await self._record_outcomes(event_id, game, home_id, away_id)
-                        outcomes_recorded += recorded
+                # Record outcomes for final games regardless of status change
+                # (_record_outcomes has idempotency guards via _CHECK_OUTCOME_EXISTS)
+                if self._is_game_final(game):
+                    recorded = await self._record_outcomes(event_id, game, home_id, away_id)
+                    outcomes_recorded += recorded
             except Exception as e:
                 bt.logging.warning({"sdio_status_sync_error": str(e), "event_id": event_id})
             
@@ -910,6 +930,47 @@ class SportsDataIngestor:
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
+
+    async def _ensure_sportsbooks(self, fresh_odds: List[GameOdds]) -> None:
+        """Register any new sportsbook codes found in fresh odds.
+
+        Upserts into sportsbook table and seeds sportsbook_bias with
+        neutral values for new entries. Idempotent via ON CONFLICT DO NOTHING.
+        """
+        codes = {odds.sportsbook for odds in fresh_odds if odds.sportsbook}
+        if not codes:
+            return
+
+        # Fetch already-registered codes to skip redundant writes
+        existing_rows = await self.database.read(
+            _SELECT_SPORTSBOOK_CODES,
+            params={"provider_id": self.provider_id},
+            mappings=True,
+        )
+        existing_codes = {r["code"] for r in existing_rows}
+        new_codes = codes - existing_codes
+        if not new_codes:
+            return
+
+        for code in sorted(new_codes):
+            rows = await self.database.write(
+                _UPSERT_SPORTSBOOK,
+                params={"provider_id": self.provider_id, "code": code, "name": code},
+                return_rows=True,
+            )
+            if rows:
+                sportsbook_id = rows[0][0]
+                await self.database.write(
+                    _SEED_SPORTSBOOK_BIAS,
+                    params={"sportsbook_id": sportsbook_id},
+                )
+                bt.logging.info({
+                    "sportsbook_registered": {
+                        "code": code,
+                        "sportsbook_id": sportsbook_id,
+                    }
+                })
+
     async def _persist_odds(self, state: LeagueState, tracked: TrackedEvent, odds_set: GameOddsSet) -> Optional[datetime]:
         fresh_odds = self._filter_new_pregame(tracked, odds_set)
         if not fresh_odds:
@@ -922,6 +983,8 @@ class SportsDataIngestor:
                 }
             )
             return None
+        # Register any new sportsbook codes before inserting quotes
+        await self._ensure_sportsbooks(fresh_odds)
         quotes: List[ProviderQuoteRow] = []
         provider_id = self.provider_id
         for odds in fresh_odds:

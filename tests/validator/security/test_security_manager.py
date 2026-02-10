@@ -134,7 +134,7 @@ class TestSecurityManager:
     def test_is_blacklisted_hotkey(self):
         """Test checking if a hotkey is blacklisted."""
         manager = SecurityManager()
-        manager._blacklist_hotkeys = {"bad_hotkey"}
+        manager._blacklist_hotkeys = {"bad_hotkey": None}
         
         is_blocked, reason = manager.is_blacklisted("bad_hotkey", None)
         assert is_blocked is True
@@ -147,7 +147,7 @@ class TestSecurityManager:
     def test_is_blacklisted_ip(self):
         """Test checking if an IP is blacklisted."""
         manager = SecurityManager()
-        manager._blacklist_ips = {"192.168.1.100"}
+        manager._blacklist_ips = {"192.168.1.100": None}
         
         is_blocked, reason = manager.is_blacklisted(None, "192.168.1.100")
         assert is_blocked is True
@@ -193,7 +193,7 @@ class TestSecurityManager:
     def test_check_request_blacklisted(self):
         """Test that blacklisted hotkeys are rejected."""
         manager = SecurityManager()
-        manager._blacklist_hotkeys = {"bad_hotkey"}
+        manager._blacklist_hotkeys = {"bad_hotkey": None}
         
         allowed, reason = manager.check_request("bad_hotkey", "192.168.1.1")
         
@@ -227,8 +227,8 @@ class TestSecurityManager:
         """Test getting manager statistics."""
         manager = SecurityManager()
         manager._registered_hotkeys = {"h1", "h2", "h3"}
-        manager._blacklist_hotkeys = {"bad1"}
-        manager._blacklist_ips = {"ip1", "ip2"}
+        manager._blacklist_hotkeys = {"bad1": None}
+        manager._blacklist_ips = {"ip1": None, "ip2": None}
         
         stats = manager.get_stats()
         
@@ -285,8 +285,8 @@ class TestSecurityManagerAsync:
         """Test loading blacklist from database."""
         mock_db = AsyncMock()
         mock_db.read = AsyncMock(return_value=[
-            {"identifier": "bad_hotkey", "identifier_type": "hotkey"},
-            {"identifier": "192.168.1.100", "identifier_type": "ip"},
+            {"identifier": "bad_hotkey", "identifier_type": "hotkey", "expires_at": None},
+            {"identifier": "192.168.1.100", "identifier_type": "ip", "expires_at": None},
         ])
         
         manager = SecurityManager(database=mock_db)
@@ -327,7 +327,7 @@ class TestSecurityManagerEnforcement:
             enforce_blacklist=False,
         )
         manager = SecurityManager(config=config)
-        manager._blacklist_hotkeys = {"blocked_hotkey"}
+        manager._blacklist_hotkeys = {"blocked_hotkey": None}
         
         # Even blacklisted should be allowed
         allowed, reason = manager.check_request("blocked_hotkey", "192.168.1.1")

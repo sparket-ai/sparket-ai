@@ -58,7 +58,7 @@ class TestSecurityMiddleware:
     async def test_blacklisted_hotkey_rejected(self):
         """Test that blacklisted hotkeys are rejected with 403."""
         manager = SecurityManager()
-        manager._blacklist_hotkeys = {"test_hotkey_12345"}
+        manager._blacklist_hotkeys = {"test_hotkey_12345": None}
         
         app = MagicMock()
         middleware = SecurityMiddleware(app, manager)

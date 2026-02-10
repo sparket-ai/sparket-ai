@@ -357,10 +357,14 @@ class MinerRollingScore(Base):
         Numeric,
         comment="Info dimension = 0.6*SOS + 0.4*LEAD",
     )
+    skill_dim: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Skill dimension = PSS_norm (outcome relative skill)",
+    )
     # Final composite score
     skill_score: Mapped[float | None] = mapped_column(
         Numeric,
-        comment="Final skill score = 0.5*Forecast + 0.3*Econ + 0.2*Info",
+        comment="Final skill score = 0.10*ForecastDim + 0.10*SkillDim + 0.50*EconDim + 0.30*InfoDim",
     )
     composite_score: Mapped[float | None] = mapped_column(
         Numeric,

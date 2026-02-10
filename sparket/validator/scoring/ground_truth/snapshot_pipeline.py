@@ -67,7 +67,8 @@ _SELECT_MARKET_QUOTES = text("""
     JOIN market m ON pq.market_id = m.market_id
     JOIN event e ON m.event_id = e.event_id
     JOIN league l ON e.league_id = l.league_id
-    LEFT JOIN sportsbook s ON pq.provider_id = s.provider_id
+    LEFT JOIN sportsbook s ON s.provider_id = pq.provider_id
+        AND s.code = pq.raw->>'sportsbook'
     WHERE pq.market_id = :market_id
       AND pq.ts >= :since
       AND pq.ts < :until

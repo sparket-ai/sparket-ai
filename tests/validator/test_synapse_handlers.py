@@ -134,7 +134,7 @@ class TestIngestOddsHandler:
         assert params["miner_id"] == 42  # From hotkey lookup, not payload
         assert params["market_id"] == 100
         assert params["miner_hotkey"] == "miner_hotkey_123"
-        assert params["side"] in ("home", "away")
+        assert params["side"] in ("HOME", "AWAY")
         assert params["odds_eu"] in (1.91, 2.05)
     
     async def test_rejects_unregistered_miner(self, handler, db):
