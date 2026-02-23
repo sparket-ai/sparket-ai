@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
 from sparket.shared.rows import EventRow, MarketRow
+
+MarketKey = Tuple[str, Optional[Decimal], Optional[int]]
 
 
 def _ensure_utc(dt: datetime | None) -> datetime | None:
@@ -109,18 +111,91 @@ async def ensure_market(database: Any, market_row: MarketRow, *, event_id: int) 
         "points_team_id": market_row.get("points_team_id"),
         "created_at": _ensure_utc(market_row.get("created_at")) or datetime.now(timezone.utc),
     }
-    # Check if market exists first
     found = await database.read(_SELECT_MARKET, params=params, mappings=True)
     if found:
         return int(found[0]["market_id"])
-    # Try insert - may fail on duplicate key if race condition
     try:
         await database.write(_INSERT_MARKET, params=params)
     except Exception:
-        pass  # Ignore duplicate key errors, we'll select again
-    # Re-select to get the market_id (whether newly inserted or existing)
+        pass
     found = await database.read(_SELECT_MARKET, params=params, mappings=True)
     if not found:
         raise RuntimeError("failed to upsert market")
     return int(found[0]["market_id"])
+
+
+def _market_key(row: MarketRow) -> MarketKey:
+    """Normalise a MarketRow into a hashable lookup key."""
+    kind = row.get("kind")
+    if hasattr(kind, "name"):
+        kind = kind.name
+    elif isinstance(kind, str):
+        kind = kind.upper()
+    raw_line = row.get("line")
+    line = Decimal(str(raw_line)) if raw_line is not None else None
+    pts = row.get("points_team_id")
+    return (str(kind), line, int(pts) if pts is not None else None)
+
+
+_SELECT_ALL_MARKETS_FOR_EVENT = text(
+    """
+    SELECT market_id, kind, 
+           COALESCE(line, CAST(0 AS numeric)) AS line_cmp,
+           line,
+           COALESCE(points_team_id, CAST(0 AS bigint)) AS pts_cmp,
+           points_team_id
+    FROM market
+    WHERE event_id = :event_id
+    """
+)
+
+
+async def ensure_markets_batch(
+    database: Any,
+    market_rows: List[MarketRow],
+    *,
+    event_id: int,
+) -> Dict[MarketKey, int]:
+    """Resolve market IDs for multiple rows with minimal DB round-trips.
+
+    1. One SELECT to fetch all existing markets for the event.
+    2. Determine which rows are new.
+    3. Individual INSERTs for new markets (with conflict handling).
+    4. Returns mapping of (kind, line, points_team_id) -> market_id.
+    """
+    if not market_rows:
+        return {}
+
+    existing = await database.read(
+        _SELECT_ALL_MARKETS_FOR_EVENT,
+        params={"event_id": event_id},
+        mappings=True,
+    )
+
+    known: Dict[MarketKey, int] = {}
+    for row in existing:
+        k = row["kind"]
+        if hasattr(k, "name"):
+            k = k.name
+        elif isinstance(k, str):
+            k = k.upper()
+        raw_line = row["line"]
+        line = Decimal(str(raw_line)) if raw_line is not None else None
+        pts = row["points_team_id"]
+        key = (str(k), line, int(pts) if pts is not None else None)
+        known[key] = int(row["market_id"])
+
+    result: Dict[MarketKey, int] = {}
+    for mrow in market_rows:
+        key = _market_key(mrow)
+        if key in known:
+            result[key] = known[key]
+            continue
+        if key in result:
+            continue
+        mid = await ensure_market(database, mrow, event_id=event_id)
+        result[key] = mid
+        known[key] = mid
+
+    return result
 

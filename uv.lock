@@ -2905,7 +2905,7 @@ wheels = [
 
 [[package]]
 name = "sparket-subnet"
-version = "0.0.4"
+version = "0.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

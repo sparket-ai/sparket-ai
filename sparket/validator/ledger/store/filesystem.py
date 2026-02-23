@@ -1,8 +1,8 @@
 """Filesystem-based LedgerStore implementation.
 
 Writes gzip-compressed JSON to a local directory tree:
-  {data_dir}/ledger/checkpoints/epoch_{N}_{date}/
-  {data_dir}/ledger/deltas/epoch_{N}/{delta_id}/
+  {data_dir}/checkpoints/epoch_{N}_{date}/
+  {data_dir}/deltas/epoch_{N}/{delta_id}/
 
 Retention: keep all data within the retention window, auto-prune older.
 """
@@ -51,7 +51,7 @@ class FilesystemStore:
     """Local filesystem LedgerStore implementation."""
 
     def __init__(self, data_dir: str, retention_days: int = 7):
-        self.base = Path(data_dir) / "ledger"
+        self.base = Path(data_dir)
         self.checkpoints_dir = self.base / "checkpoints"
         self.deltas_dir = self.base / "deltas"
         self.retention_days = retention_days

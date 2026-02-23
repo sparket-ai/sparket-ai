@@ -345,20 +345,35 @@ pm2 logs auditor-local
 pm2 save
 ```
 
-Or foreground for testing:
+Or foreground for testing (requires a `.env` file in the project root with
+the auditor configuration above, since `--auditor.*` flags are read from
+env vars):
 ```bash
 uv run python sparket/entrypoints/auditor.py \
   --wallet.name your-wallet \
   --wallet.hotkey your-hotkey \
-  --subtensor.chain_endpoint ws://your-subtensor:9945 \
+  --subtensor.network finney \
   --netuid 57
 ```
 
-You should see logs showing:
-1. Authentication with the primary
-2. Checkpoint fetched
-3. Brier scores verified
-4. Weights computed and set on chain
+If you see `SPARKET_AUDITOR__PRIMARY_HOTKEY is required` and the process
+exits, your `.env` file is missing or not in the current directory. Make
+sure you run the command from the project root where `.env` lives.
+
+You should see logs showing (auditor now defaults to TRACE verbosity):
+1. `auditor: starting` and `auditor_config` with your settings
+2. `auditor_cycle: starting` every poll interval
+3. `auditor_sync` with checkpoint and delta fetch results
+4. `auditor_plugin_result` with weight verification status
+5. `auditor_runtime: sleeping` with `next_poll_in_seconds`
+
+Cadence note: auditor is poll-interval based (default 900s / 15 minutes), not
+epoch-based. A quiet period between cycles is expected. If you need tighter
+alignment with primary export cadence, lower
+`SPARKET_AUDITOR__POLL_INTERVAL_SECONDS` (for example, 750-900 seconds).
+
+If you need less verbosity, pass `--logging.info` (or `--logging.debug`
+for moderate verbosity).
 
 ### What gets verified
 

@@ -3,6 +3,7 @@ from datetime import datetime
 from sparket.providers.sportsdataio import (
     Game,
     GameOdds,
+    GameOddsSet,
     GameStatus,
     MoneylinePrice,
     SpreadPrice,
@@ -100,6 +101,77 @@ def test_game_falls_back_to_score_id_and_utc_time():
     )
     assert game.game_id == 31415
     assert game.date_time is not None and game.date_time.tzinfo is not None
+
+
+def test_game_normalizes_team_score_aliases():
+    game = Game.model_validate(
+        {
+            "GameID": 91,
+            "Season": 2026,
+            "SeasonType": "Regular",
+            "DateTime": "2026-01-10T19:00:00",
+            "Status": "Final",
+            "HomeTeam": "LAL",
+            "AwayTeam": "BOS",
+            "HomeTeamScore": 112,
+            "AwayTeamScore": 104,
+        }
+    )
+    assert game.home_score == 112
+    assert game.away_score == 104
+
+
+def test_game_normalizes_runs_aliases():
+    game = Game.model_validate(
+        {
+            "GameID": 92,
+            "Season": 2025,
+            "SeasonType": "Regular",
+            "DateTime": "2025-08-02T19:00:00",
+            "Status": "Final",
+            "HomeTeam": "NYY",
+            "AwayTeam": "BOS",
+            "HomeTeamRuns": 6,
+            "AwayTeamRuns": 4,
+        }
+    )
+    assert game.home_score == 6
+    assert game.away_score == 4
+
+
+def test_game_prefers_team_keys_over_names():
+    game = Game.model_validate(
+        {
+            "GameId": 93,
+            "Season": 2026,
+            "SeasonType": "Regular",
+            "DateTime": "2026-02-14T14:30:00",
+            "Status": "Scheduled",
+            "HomeTeamName": "BV Borussia 09 Dortmund",
+            "AwayTeamName": "1. FSV Mainz 05",
+            "HomeTeamKey": "BVB",
+            "AwayTeamKey": "MAI",
+            "HomeTeamId": 532,
+            "AwayTeamId": 528,
+        }
+    )
+    assert game.home_team == "BVB"
+    assert game.away_team == "MAI"
+
+
+def test_game_odds_set_normalizes_score_aliases():
+    odds_set = GameOddsSet.model_validate(
+        {
+            "GameId": 19098,
+            "Status": "Final",
+            "HomeTeamScore": 9,
+            "AwayTeamScore": 20,
+            "PregameOdds": [],
+        }
+    )
+    assert odds_set.home_score == 9
+    assert odds_set.away_score == 20
+    assert odds_set.status == GameStatus.FINAL
 
 
 def test_soccer_ternary_moneyline_with_draw():

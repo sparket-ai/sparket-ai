@@ -22,9 +22,9 @@ from sparket.validator.config.scoring_params import get_scoring_params
 _INSERT_INBOX = text(
     """
     INSERT INTO inbox (
-        topic, payload, created_at, processed, dedupe_key
+        topic, payload, created_at, processed, retry_count, dedupe_key
     ) VALUES (
-        :topic, :payload, :created_at, false, :dedupe_key
+        :topic, :payload, :created_at, false, 0, :dedupe_key
     )
     """
 )
@@ -84,112 +84,47 @@ class IngestOutcomeHandler:
         self._ingest_params = get_scoring_params().ingest
 
     async def handle_synapse(self, synapse: SparketSynapse) -> MinerOutcomePushed | None:
-        """Process OUTCOME_PUSH synapse from miner."""
+        """Queue OUTCOME_PUSH for asynchronous processing and return immediately."""
         if synapse.type != SparketSynapseType.OUTCOME_PUSH:
             return None
-        
+
         miner_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None) or ""
         raw = synapse.payload if isinstance(synapse.payload, dict) else {}
         received_at = datetime.now(timezone.utc)
-        
-        # Extract and validate event_id
+
         event_id = self._extract_event_id(raw)
-        if event_id is None:
-            bt.logging.debug({"ingest_outcome": "missing_event_id"})
-            return MinerOutcomePushed(
-                miner_hotkey=miner_hotkey, 
-                payload={"accepted": False, "reason": "missing_event_id"}
-            )
-        
-        # Validate event is eligible for outcome submission
-        validation = await self._validate_event(event_id, received_at)
-        if not validation["valid"]:
-            bt.logging.info({
-                "ingest_outcome_rejected": {
-                    "event_id": event_id,
-                    "reason": validation["reason"],
-                }
-            })
-            return MinerOutcomePushed(
-                miner_hotkey=miner_hotkey,
-                payload={"accepted": False, "event_id": event_id, "reason": validation["reason"]}
-            )
-        
-        # Validate required outcome fields
-        outcome_data = self._extract_outcome_data(raw)
-        if not outcome_data:
-            bt.logging.debug({"ingest_outcome": "invalid_outcome_data"})
-            return MinerOutcomePushed(
-                miner_hotkey=miner_hotkey,
-                payload={"accepted": False, "event_id": event_id, "reason": "invalid_outcome_data"}
-            )
-        
-        # Build inbox envelope
+        dedupe_event_id = event_id if event_id is not None else 0
         envelope = {
             "topic": "outcome.submit",
             "payload": json.dumps({
-                "event_id": event_id,
                 "miner_hotkey": miner_hotkey,
                 "received_at": received_at.isoformat(),
-                "outcome": outcome_data,
                 "raw": raw,
             }),
             "created_at": received_at,
             "dedupe_key": _bucket_key(
-                event_id,
+                dedupe_event_id,
                 miner_hotkey,
                 received_at,
                 self._ingest_params.outcome_bucket_seconds,
             ),
         }
-        
-        # Rate limit per event/day
-        if not await self._within_daily_event_cap(event_id, miner_hotkey, received_at):
-            return MinerOutcomePushed(
-                miner_hotkey=miner_hotkey,
-                payload={
-                    "accepted": False,
-                    "event_id": event_id,
-                    "reason": "rate_limited",
-                },
-            )
 
-        # Check for duplicate submission
-        dedupe_key = envelope["dedupe_key"]
-        existing = await self.database.read(
-            _CHECK_DEDUPE, 
-            params={"dedupe_key": dedupe_key},
-            mappings=True
-        )
-        
-        if existing:
-            bt.logging.debug({"ingest_outcome": "duplicate_submission", "dedupe_key": dedupe_key})
-            accepted = True  # Already have it, consider it accepted
-        else:
-            # Persist to inbox for async processing
-            try:
-                await self.database.write(_INSERT_INBOX, params=envelope)
-                accepted = True
-            except Exception as e:
-                bt.logging.warning({"ingest_outcome_persist_error": str(e)})
-                accepted = False
-        
-        event = MinerOutcomePushed(
-            miner_hotkey=miner_hotkey, 
+        accepted = False
+        try:
+            await self.database.write(_INSERT_INBOX, params=envelope)
+            accepted = True
+        except Exception as e:
+            bt.logging.warning({"ingest_outcome_enqueue_error": str(e)})
+
+        return MinerOutcomePushed(
+            miner_hotkey=miner_hotkey,
             payload={
                 "accepted": accepted,
+                "queued": accepted,
                 "event_id": event_id,
-                "event_status": validation.get("status"),
-            }
+            },
         )
-        bt.logging.info({
-            "ingest_outcome": {
-                "miner": miner_hotkey[:16] + "...",
-                "event_id": event_id,
-                "accepted": accepted,
-            }
-        })
-        return event
 
     async def _within_daily_event_cap(
         self,

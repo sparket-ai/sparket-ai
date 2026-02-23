@@ -75,13 +75,15 @@ try {
   console.warn(`Unable to create PM2 log directory at ${logDir}: ${error.message}`);
 }
 
+// Which process group to start.  Default is "primary" (validator + ingestor).
+// Set SPARKET_PM2_PROFILE=auditor to start the auditor instead.
+const profile = (envVars.SPARKET_PM2_PROFILE || process.env.SPARKET_PM2_PROFILE || 'primary').toLowerCase();
+
 console.log(
-  `PM2 will run from ${projectRoot}. Loaded ${Object.keys(envVars).length} environment variables from .env`
+  `PM2 will run from ${projectRoot} [profile=${profile}]. Loaded ${Object.keys(envVars).length} environment variables from .env`
 );
 
-module.exports = {
-  apps: [
-    {
+const validatorApp = {
       name: 'validator-local',
       script: scriptPath,
       interpreter,
@@ -107,7 +109,7 @@ module.exports = {
       // Auto-restart configuration
       autorestart: true,
       watch: false,
-      max_memory_restart: '2G',
+      max_memory_restart: '8G',
       
       // Restart behavior
       min_uptime: '10s',
@@ -132,12 +134,47 @@ module.exports = {
       pmx: true,
       automation: true,
       vizion: true,
-    },
-    
-    // Auditor validator - disabled by default.
-    // Enable by: pm2 start ecosystem.config.js --only auditor-local
-    // Requires: SPARKET_AUDITOR__PRIMARY_HOTKEY and SPARKET_AUDITOR__PRIMARY_URL in .env
-    {
+};
+
+const ingestorApp = {
+      name: 'ingestor-local',
+      script: path.join(projectRoot, 'sparket/entrypoints/ingestor.py'),
+      interpreter,
+      cwd: projectRoot,
+      instances: 1,
+      exec_mode: 'fork',
+      
+      env: {
+        NODE_ENV: 'production',
+        PYTHONUNBUFFERED: '1',
+        SPARKET_ROLE: 'ingestor',
+        PROJECT_ROOT: projectRoot,
+        PM2_LOG_DIR: logDir,
+        VENV_PYTHON: interpreter,
+        ...envVars,
+      },
+      
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '1G',
+      
+      min_uptime: '10s',
+      max_restarts: 10,
+      restart_delay: 4000,
+      
+      error_file: path.join(logDir, 'ingestor-local-error.log'),
+      out_file: path.join(logDir, 'ingestor-local-out.log'),
+      log_file: path.join(logDir, 'ingestor-local-combined.log'),
+      time: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      
+      kill_timeout: 5000,
+      wait_ready: false,
+      listen_timeout: 10000,
+};
+
+const auditorApp = {
       name: 'auditor-local',
       script: path.join(projectRoot, 'sparket/entrypoints/auditor.py'),
       interpreter,
@@ -173,19 +210,16 @@ module.exports = {
       kill_timeout: 5000,
       wait_ready: false,
       listen_timeout: 10000,
-    },
-  ],
-  
-  // Deployment configuration (optional)
-  deploy: {
-    // production: {
-    //   user: 'deploy',
-    //   host: 'your-server.com',
-    //   ref: 'origin/main',
-    //   repo: 'git@github.com:your-repo/sparket-subnet.git',
-    //   path: '/var/www/sparket-subnet',
-    //   'post-deploy': 'pip install -r requirements.txt && pm2 reload ecosystem.config.js',
-    // },
-  },
+};
+
+// Build apps list based on profile
+const profiles = {
+  primary: [validatorApp, ingestorApp],
+  auditor: [auditorApp],
+  all: [validatorApp, ingestorApp, auditorApp],
+};
+
+module.exports = {
+  apps: profiles[profile] || profiles.primary,
 };
 

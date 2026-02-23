@@ -188,12 +188,34 @@ class SportsDataIOClient:
                     bt.logging.debug({"sdio_http_404": {"url": url}})
                     return []
                 if status in (401, 403):
+                    bt.logging.error({
+                        "sdio_auth_error": {
+                            "status": status,
+                            "url": url.split("?")[0],
+                            "body": exc.response.text[:200],
+                        }
+                    })
                     raise
                 if attempt >= self.max_retries:
+                    bt.logging.warning({
+                        "sdio_http_exhausted": {
+                            "status": status,
+                            "url": url.split("?")[0],
+                            "attempts": attempt + 1,
+                        }
+                    })
                     raise
                 await asyncio.sleep(backoff)
-            except (httpx.RequestError, httpx.TimeoutException):
+            except (httpx.RequestError, httpx.TimeoutException) as exc:
                 if attempt >= self.max_retries:
+                    bt.logging.warning({
+                        "sdio_request_exhausted": {
+                            "error": str(exc),
+                            "type": type(exc).__name__,
+                            "url": url.split("?")[0],
+                            "attempts": attempt + 1,
+                        }
+                    })
                     raise
                 await asyncio.sleep(backoff)
             attempt += 1
@@ -202,8 +224,22 @@ class SportsDataIOClient:
     def _parse_games(self, payload: Any) -> List[Game]:
         games: List[Game] = []
         for item in payload or []:
+            home_candidate = (
+                item.get("HomeTeam")
+                or item.get("HomeTeamKey")
+                or item.get("HomeTeamName")
+                or item.get("HomeTeamId")
+                or item.get("HomeTeamID")
+            )
+            away_candidate = (
+                item.get("AwayTeam")
+                or item.get("AwayTeamKey")
+                or item.get("AwayTeamName")
+                or item.get("AwayTeamId")
+                or item.get("AwayTeamID")
+            )
             try:
-                away = str(item.get("AwayTeam", "")).upper()
+                away = str(away_candidate or "").upper()
             except Exception:
                 away = ""
             has_identity = any(item.get(key) for key in ("GameID", "GameId", "ScoreID", "GlobalGameID", "GameKey"))
@@ -212,10 +248,23 @@ class SportsDataIOClient:
                     {
                         "sdio_skip_game": {
                             "reason": "missing_identity_or_bye",
-                            "home": item.get("HomeTeam"),
-                            "away": item.get("AwayTeam"),
+                            "home": home_candidate,
+                            "away": away_candidate,
                             "season": item.get("Season"),
                             "week": item.get("Week"),
+                        }
+                    }
+                )
+                continue
+            if not home_candidate or not away_candidate:
+                bt.logging.debug(
+                    {
+                        "sdio_skip_game": {
+                            "reason": "missing_team_identity",
+                            "game_id": item.get("GameID") or item.get("GameId") or item.get("ScoreID"),
+                            "home": home_candidate,
+                            "away": away_candidate,
+                            "status": item.get("Status"),
                         }
                     }
                 )

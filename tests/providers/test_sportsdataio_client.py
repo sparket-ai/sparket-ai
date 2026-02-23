@@ -94,3 +94,37 @@ async def _assert_fetch_line_history_handles_list_payload(monkeypatch):
     assert len(odds_set.pregame) == 1
 
 
+def test_parse_games_skips_rows_with_missing_teams():
+    league_cfg = _league_cfg()
+    client = SportsDataIOClient(api_key="test", config=SportsDataIOConfig(leagues=[league_cfg]))
+    try:
+        payload = [
+            {
+                "GameId": 111,
+                "Season": 2026,
+                "SeasonType": "Regular",
+                "Status": "Scheduled",
+                "HomeTeamKey": "BVB",
+                "AwayTeamKey": "MAI",
+                "DateTime": "2026-02-14T14:30:00",
+            },
+            {
+                "GameId": 112,
+                "Season": 2026,
+                "SeasonType": "Regular",
+                "Status": "Scheduled",
+                "HomeTeam": None,
+                "AwayTeam": None,
+                "DateTime": "2026-02-14T14:30:00",
+            },
+        ]
+        games = client._parse_games(payload)
+    finally:
+        asyncio.run(client.close())
+
+    assert len(games) == 1
+    assert games[0].game_id == 111
+    assert games[0].home_team == "BVB"
+    assert games[0].away_team == "MAI"
+
+

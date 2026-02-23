@@ -120,11 +120,23 @@ async def run_outcome_processing_if_due(
             if not isinstance(payload, dict):
                 raise ValueError("payload_not_dict")
 
-            event_id = payload.get("event_id")
+            raw = payload.get("raw")
+            if isinstance(raw, dict):
+                # New envelope shape: payload contains raw miner body.
+                event_id = raw.get("event_id")
+                outcome = {
+                    "result": raw.get("result"),
+                    "score_home": raw.get("score_home"),
+                    "score_away": raw.get("score_away"),
+                    "details": raw.get("details"),
+                }
+            else:
+                # Legacy envelope shape.
+                event_id = payload.get("event_id")
+                outcome = payload.get("outcome") or {}
+
             if event_id is None:
                 raise ValueError("missing_event_id")
-
-            outcome = payload.get("outcome") or {}
             if not isinstance(outcome, dict):
                 raise ValueError("outcome_not_dict")
 
@@ -152,19 +164,19 @@ async def run_outcome_processing_if_due(
                 if market_result is None:
                     continue
 
-                details = {
+                details = json.dumps({
                     "source": "miner",
                     "miner_hotkey": payload.get("miner_hotkey"),
                     "received_at": payload.get("received_at") or created_at.isoformat(),
-                    "raw": payload.get("raw"),
-                }
+                    "raw": raw if isinstance(raw, dict) else payload.get("raw"),
+                })
 
                 await database.write(
                     _UPSERT_OUTCOME,
                     params={
                         "market_id": market["market_id"],
                         "settled_at": created_at,
-                        "result": market_result,
+                        "result": market_result.upper(),
                         "score_home": score_home,
                         "score_away": score_away,
                         "details": details,

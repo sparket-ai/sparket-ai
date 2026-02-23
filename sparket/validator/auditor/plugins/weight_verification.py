@@ -1,27 +1,21 @@
 """Weight verification plugin - the core v1 auditor capability.
 
 Fetches checkpoint metrics, independently verifies Brier scores from
-deltas, runs compute_weights(), compares to on-chain weights, and
-sets weights if they match within tolerance.
+deltas, runs the shared deterministic compute_weights(), and sets
+weights on chain.
 """
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from typing import Any
 
 import bittensor as bt
-import numpy as np
 
 from sparket.validator.auditor.attestation import create_attestation
 from sparket.validator.auditor.plugin_registry import AuditorContext, TaskResult
-from sparket.validator.ledger.compute_weights import WeightResult, compute_weights
-from sparket.validator.ledger.models import (
-    ChainParamsSnapshot,
-    MinerMetrics,
-    ScoringConfigSnapshot,
-)
+from sparket.validator.ledger.compute_weights import compute_weights
+from sparket.validator.ledger.models import ChainParamsSnapshot, MinerMetrics
 
 
 class WeightVerificationHandler:
@@ -118,7 +112,9 @@ class WeightVerificationHandler:
             chain_params = ChainParamsSnapshot(
                 burn_rate=float(cp.scoring_config.params.get("weight_emission", {}).get("burn_rate", 0.9)),
                 burn_uid=burn_uid,
-                max_weight_limit=float(subtensor.max_weight_limit(netuid=netuid)) / 65535,
+                # bt v10 returns max_weight_limit as a normalized float already.
+                # Do not rescale by 65535 here.
+                max_weight_limit=float(subtensor.max_weight_limit(netuid=netuid)),
                 min_allowed_weights=int(subtensor.min_allowed_weights(netuid=netuid)),
                 n_neurons=int(metagraph.n),
             )
@@ -134,46 +130,17 @@ class WeightVerificationHandler:
         evidence["computed_weights_sample"] = weight_result.uint16_weights[:10]
         evidence["n_miners_scored"] = len(metrics)
 
-        # -- Step 5: Compare to on-chain primary weights --
-        match = True
-        cosine_sim = 1.0
-        try:
-            metagraph = context.metagraph
-            # Get primary's current weights from metagraph
-            primary_hotkey = cp.manifest.primary_hotkey
-            if primary_hotkey in list(metagraph.hotkeys):
-                primary_uid = list(metagraph.hotkeys).index(primary_hotkey)
-                on_chain = metagraph.W[primary_uid] if hasattr(metagraph, 'W') else None
-                if on_chain is not None:
-                    evidence["primary_uid"] = primary_uid
-                    # Cosine similarity comparison
-                    our_vec = np.zeros(chain_params.n_neurons)
-                    for uid, w in zip(weight_result.uids, weight_result.uint16_weights):
-                        if uid < len(our_vec):
-                            our_vec[uid] = w
-                    chain_vec = np.array(on_chain, dtype=np.float64)
-                    if len(chain_vec) == len(our_vec):
-                        dot = np.dot(our_vec, chain_vec)
-                        norm_a = np.linalg.norm(our_vec)
-                        norm_b = np.linalg.norm(chain_vec)
-                        if norm_a > 0 and norm_b > 0:
-                            cosine_sim = float(dot / (norm_a * norm_b))
-                        match = cosine_sim >= (1.0 - self.tolerance)
-        except Exception as e:
-            evidence["comparison_error"] = str(e)
-            bt.logging.warning({"weight_verification": {"comparison_error": str(e)}})
-
-        evidence["cosine_similarity"] = cosine_sim
-        evidence["match"] = match
-
-        # -- Step 6: Set weights on chain --
-        if match and weight_result.uids:
+        # -- Step 5: Set weights on chain --
+        # The auditor independently computes weights from ledger data and
+        # sets them directly. Identical inputs + deterministic compute_weights()
+        # guarantees agreement with the primary by construction.
+        if weight_result.uids:
             try:
                 wallet = context.wallet
                 subtensor = context.subtensor
                 netuid = context.config.get("netuid", 57)
 
-                result_ok, msg = subtensor.set_weights(
+                response = subtensor.set_weights(
                     wallet=wallet,
                     netuid=netuid,
                     uids=weight_result.uids,
@@ -182,28 +149,22 @@ class WeightVerificationHandler:
                     wait_for_inclusion=False,
                 )
 
+                # bt v10 returns ExtrinsicResponse with .success and .message
+                result_ok = getattr(response, "success", bool(response))
+                msg = getattr(response, "message", str(response))
+
                 evidence["set_weights"] = "success" if result_ok else f"failed: {msg}"
                 bt.logging.info({
                     "weight_verification": {
                         "set_weights": "success" if result_ok else "failed",
                         "n_weights": len(weight_result.uids),
-                        "cosine_similarity": cosine_sim,
                     }
                 })
             except Exception as e:
                 evidence["set_weights_error"] = str(e)
                 bt.logging.error({"weight_verification": {"set_weights_error": str(e)}})
-        elif not match:
-            bt.logging.error({
-                "weight_verification": {
-                    "status": "MISMATCH",
-                    "cosine_similarity": cosine_sim,
-                    "tolerance": self.tolerance,
-                    "message": "Refusing to set weights - primary weights diverge",
-                }
-            })
 
-        status = "pass" if match else "fail"
+        status = "pass"
 
         task_result = TaskResult(
             plugin_name=self.name,

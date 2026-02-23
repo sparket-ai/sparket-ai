@@ -101,6 +101,19 @@ class TestTTLCache:
         assert len(cache) == 1
         cache.set("key2", "value2")
         assert len(cache) == 2
+
+    def test_maxsize_evicts_lru(self):
+        """Cache evicts least recently used items when full."""
+        cache: TTLCache[str] = TTLCache(ttl_seconds=60, maxsize=2)
+
+        cache.set("k1", "v1")
+        cache.set("k2", "v2")
+        assert cache.get("k1") == "v1"  # touch k1 so k2 becomes LRU
+        cache.set("k3", "v3")
+
+        assert cache.get("k1") == "v1"
+        assert cache.get("k2") is None
+        assert cache.get("k3") == "v3"
     
     @pytest.mark.asyncio
     async def test_get_or_set_cached(self):

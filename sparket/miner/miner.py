@@ -136,6 +136,7 @@ class BaseMinerNeuron(BaseNeuron):
                 self.game_sync = GameDataSync(
                     database=self.dbm,
                     client=self.validator_client,
+                    odds_window_days=self.app_config.validator.ingest.odds_window_days,
                 )
             bt.logging.info({"miner_init": {"step": "validator_client_ready"}})
         except Exception as exc:

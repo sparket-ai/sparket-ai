@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, Optional, TypeVar
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Generic, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -43,14 +44,16 @@ class TTLCache(Generic[T]):
         value = await cache.get_or_set("key", fetch_data)
     """
     
-    def __init__(self, ttl_seconds: float = 3600) -> None:
+    def __init__(self, ttl_seconds: float = 3600, maxsize: int = 1024) -> None:
         """Initialize cache.
         
         Args:
             ttl_seconds: Time-to-live for cached values (default: 1 hour)
+            maxsize: Maximum number of entries to retain (LRU eviction).
         """
         self.ttl_seconds = ttl_seconds
-        self._cache: Dict[str, CacheEntry[T]] = {}
+        self.maxsize = max(1, int(maxsize))
+        self._cache: OrderedDict[str, CacheEntry[T]] = OrderedDict()
         self._lock = asyncio.Lock()
     
     def get(self, key: str) -> Optional[T]:
@@ -69,6 +72,8 @@ class TTLCache(Generic[T]):
             # Clean up expired entry
             del self._cache[key]
             return None
+        # LRU touch
+        self._cache.move_to_end(key)
         return entry.value
     
     def set(self, key: str, value: T, ttl: Optional[float] = None) -> None:
@@ -82,6 +87,9 @@ class TTLCache(Generic[T]):
         ttl_seconds = ttl if ttl is not None else self.ttl_seconds
         expires_at = time.time() + ttl_seconds
         self._cache[key] = CacheEntry(value=value, expires_at=expires_at)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.maxsize:
+            self._cache.popitem(last=False)
     
     async def get_or_set(
         self, 

@@ -109,6 +109,21 @@ class TestChallengeResponse:
         result = policy.verify_response("validator_high", "nonexistent_nonce", "sig")
         assert result is None
 
+    def test_pending_challenges_capped(self):
+        metagraph = MockMetagraph([
+            {"hotkey": "validator_high", "vpermit": True, "stake": 200_000},
+        ])
+        policy = AccessPolicy(metagraph=metagraph, max_pending_challenges=2)
+
+        n1 = policy.issue_challenge("validator_high")
+        n2 = policy.issue_challenge("validator_high")
+        n3 = policy.issue_challenge("validator_high")
+
+        assert len(policy._challenges) == 2
+        assert n1 not in policy._challenges
+        assert n2 in policy._challenges
+        assert n3 in policy._challenges
+
     def test_wrong_hotkey_for_nonce(self, policy):
         nonce = policy.issue_challenge("validator_high")
         # Try to use with different hotkey

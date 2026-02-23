@@ -108,6 +108,7 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
                 return None
 
         # Route: ODDS_PUSH
+        # Keep request path lightweight: ingest only; scoring is batch/offline.
         if synapse_type == SparketSynapseType.ODDS_PUSH.value:
             from sparket.validator.observability.metrics import (
                 SUBMISSIONS_RECEIVED, SUBMISSIONS_ACCEPTED, SUBMISSIONS_REJECTED,
@@ -117,20 +118,30 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
             with SUBMISSION_PROCESSING.time():
                 event = await validator.handlers.ingest_odds_handler.handle_synapse(synapse)
             if event is not None:
-                await validator.handlers.odds_score_handler.score_event(event)
-                SUBMISSIONS_ACCEPTED.inc()
-                synapse.payload = {"success": True, "accepted": True}
+                event_payload = event.event_data.get("payload", {}) if hasattr(event, "event_data") else {}
+                accepted = bool(event_payload.get("accepted", False))
+                synapse.payload = {
+                    "success": True,
+                    "accepted": accepted,
+                    "queued": bool(event_payload.get("queued", False)),
+                }
             else:
                 SUBMISSIONS_REJECTED.inc()
                 synapse.payload = {"success": True, "accepted": False, "message": "No valid submissions"}
             return event
 
         # Route: OUTCOME_PUSH
+        # Keep request path lightweight: ingest only; settlement scoring is batch/offline.
         if synapse_type == SparketSynapseType.OUTCOME_PUSH.value:
             event = await validator.handlers.ingest_outcome_handler.handle_synapse(synapse)
             if event is not None:
-                await validator.handlers.outcome_score_handler.score_event(event)
-                synapse.payload = {"success": True, "accepted": True}
+                event_payload = event.event_data.get("payload", {}) if hasattr(event, "event_data") else {}
+                synapse.payload = {
+                    "success": True,
+                    "accepted": bool(event_payload.get("accepted", False)),
+                    "event_id": event_payload.get("event_id"),
+                    "reason": event_payload.get("reason"),
+                }
             else:
                 synapse.payload = {"success": True, "accepted": False, "message": "No valid outcome"}
             return event

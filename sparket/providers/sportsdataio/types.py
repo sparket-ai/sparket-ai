@@ -188,9 +188,35 @@ class Game(BaseModel):
                     if alt_value not in (None, "", 0):
                         data["GameID"] = alt_value
                         break
-            # Normalize team codes - soccer uses TeamName, US sports use Team/TeamKey
-            data.setdefault("HomeTeam", data.get("HomeTeamName") or data.get("HomeTeamKey") or data.get("HomeTeamId") or data.get("HomeTeamID"))
-            data.setdefault("AwayTeam", data.get("AwayTeamName") or data.get("AwayTeamKey") or data.get("AwayTeamId") or data.get("AwayTeamID"))
+            # Normalize team identifiers.
+            # Prefer provider keys over display names to keep team resolution stable.
+            data.setdefault(
+                "HomeTeam",
+                data.get("HomeTeamKey")
+                or data.get("HomeTeamName")
+                or data.get("HomeTeamId")
+                or data.get("HomeTeamID"),
+            )
+            data.setdefault(
+                "AwayTeam",
+                data.get("AwayTeamKey")
+                or data.get("AwayTeamName")
+                or data.get("AwayTeamId")
+                or data.get("AwayTeamID"),
+            )
+            # Normalize score aliases across league-specific schedule endpoints.
+            data.setdefault(
+                "HomeScore",
+                data.get("HomeTeamScore")
+                or data.get("HomeTeamRuns")
+                or data.get("HomeRuns"),
+            )
+            data.setdefault(
+                "AwayScore",
+                data.get("AwayTeamScore")
+                or data.get("AwayTeamRuns")
+                or data.get("AwayRuns"),
+            )
             # Map provider variants into our neutral `location` field
             if "location" not in data:
                 if "StadiumDetails" in data:
@@ -387,8 +413,26 @@ class GameOddsSet(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore", frozen=True)
 
     game_id: int = Field(alias="GameID", validation_alias=AliasChoices("GameID", "GameId", "ScoreId"))
+    status: Optional[GameStatus] = Field(default=None, alias="Status")
+    home_score: Optional[int] = Field(default=None, alias="HomeScore")
+    away_score: Optional[int] = Field(default=None, alias="AwayScore")
     pregame: List[GameOdds] = Field(default_factory=list, alias="PregameOdds")
     live: Optional[List[GameOdds]] = Field(default=None, alias="LiveOdds")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_score_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        data.setdefault("HomeScore", data.get("HomeTeamScore") or data.get("HomeTeamRuns") or data.get("HomeRuns"))
+        data.setdefault("AwayScore", data.get("AwayTeamScore") or data.get("AwayTeamRuns") or data.get("AwayRuns"))
+        return data
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _coerce_status(cls, v: Any) -> Any:
+        return _coerce_status_value(v)
 
 
 class Outcome(BaseModel):

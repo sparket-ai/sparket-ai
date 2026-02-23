@@ -65,12 +65,16 @@ class AccessPolicy:
         token_ttl: int = 3600,
         rate_limit_per_hour: int = 60,
         max_tokens: int = 500,
+        max_pending_challenges: int = 1000,
     ):
         self.metagraph = metagraph
         self.min_stake_threshold = min_stake_threshold
         self.token_ttl = token_ttl
         self.rate_limit_per_hour = rate_limit_per_hour
         self.max_tokens = max_tokens
+        self.max_pending_challenges = max_pending_challenges
+        self._request_log_cleanup_interval = 300.0  # seconds
+        self._request_log_last_cleanup = 0.0
 
         # Pending challenges: nonce -> _PendingChallenge
         self._challenges: dict[str, _PendingChallenge] = {}
@@ -146,6 +150,11 @@ class AccessPolicy:
             k: v for k, v in self._challenges.items() if not v.expired
         }
 
+        # Keep pending challenge map bounded.
+        while len(self._challenges) >= self.max_pending_challenges:
+            oldest_nonce = next(iter(self._challenges))
+            self._challenges.pop(oldest_nonce, None)
+
         nonce = secrets.token_hex(32)
         self._challenges[nonce] = _PendingChallenge(
             nonce=nonce,
@@ -217,6 +226,7 @@ class AccessPolicy:
         """Check if a hotkey is within rate limits. Returns True if allowed."""
         now = time.time()
         window = 3600.0  # 1 hour
+        self._cleanup_request_log(now=now, window=window)
 
         log = self._request_log.get(hotkey, [])
         # Prune old entries
@@ -228,6 +238,17 @@ class AccessPolicy:
         if not allowed:
             bt.logging.warning({"ledger_auth": {"event": "rate_limited", "hotkey": hotkey[:16] if hotkey else "none", "requests_in_window": len(log)}})
         return allowed
+
+    def _cleanup_request_log(self, now: float, window: float) -> None:
+        """Periodically remove hotkeys with no recent requests."""
+        if (now - self._request_log_last_cleanup) < self._request_log_cleanup_interval:
+            return
+        self._request_log_last_cleanup = now
+        self._request_log = {
+            hk: timestamps
+            for hk, timestamps in self._request_log.items()
+            if any((now - ts) < window for ts in timestamps)
+        }
 
 
 __all__ = ["AccessPolicy", "EligibilityResult"]

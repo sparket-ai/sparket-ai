@@ -218,6 +218,23 @@ class TestOutcomeIngestion:
         mock_db.read.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_record_outcomes_logs_missing_scores_once_per_event(self, ingestor):
+        """Missing-score skip log should emit once per event to avoid spam."""
+        game = self._make_final_game(home_score=None, away_score=None)
+
+        with patch("sparket.validator.services.sportsdata_ingestor.bt.logging.debug") as debug_log:
+            recorded_first = await ingestor._record_outcomes(
+                event_id=42, game=game, home_team_id=10, away_team_id=20,
+            )
+            recorded_second = await ingestor._record_outcomes(
+                event_id=42, game=game, home_team_id=10, away_team_id=20,
+            )
+
+        assert recorded_first == 0
+        assert recorded_second == 0
+        assert debug_log.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_record_outcomes_idempotent(self, ingestor, mock_db):
         """Second call skips markets that already have outcomes."""
         # First read: markets exist. Second read: outcome already exists
@@ -233,6 +250,28 @@ class TestOutcomeIngestion:
         )
 
         assert recorded == 0  # Skipped because outcome already exists
+
+    @pytest.mark.asyncio
+    async def test_record_outcomes_writes_uppercase_result_enum(self, ingestor, mock_db):
+        """Outcome result persisted in DB enum format (uppercase name)."""
+        mock_db.read = AsyncMock(side_effect=[
+            [{"market_id": 100, "kind": "TOTAL", "line": 210.5, "points_team_id": None}],
+            [],
+        ])
+        mock_db.write = AsyncMock(return_value=0)
+
+        game = self._make_final_game(home_score=102, away_score=95)
+
+        with patch.object(ingestor, "_resolve_market_result", return_value="under"):
+            recorded = await ingestor._record_outcomes(
+                event_id=1, game=game, home_team_id=10, away_team_id=20,
+            )
+
+        assert recorded == 1
+        write_calls = mock_db.write.call_args_list
+        assert write_calls
+        upsert_call = write_calls[0]
+        assert upsert_call.kwargs["params"]["result"] == "UNDER"
 
 
 # ---------------------------------------------------------------------------

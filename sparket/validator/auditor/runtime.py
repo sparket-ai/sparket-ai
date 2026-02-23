@@ -69,6 +69,12 @@ class AuditorRuntime:
                 await asyncio.sleep(min(30, 5 * consecutive_errors))
                 continue
 
+            bt.logging.info({
+                "auditor_runtime": {
+                    "status": "sleeping",
+                    "next_poll_in_seconds": self._poll_interval,
+                }
+            })
             try:
                 await asyncio.sleep(self._poll_interval)
             except asyncio.CancelledError:
@@ -83,6 +89,8 @@ class AuditorRuntime:
 
     async def _cycle(self) -> None:
         """Execute one auditor cycle."""
+        bt.logging.info({"auditor_cycle": "starting"})
+
         # Resync metagraph
         try:
             self.metagraph.sync(subtensor=self.subtensor)
@@ -93,7 +101,7 @@ class AuditorRuntime:
         cp, deltas = await self.sync.sync_cycle()
 
         if cp is None:
-            bt.logging.debug({"auditor_cycle": "no_checkpoint"})
+            bt.logging.info({"auditor_cycle": "no_checkpoint_available", "hint": "primary may not have exported yet"})
             return
 
         # Verify checkpoint

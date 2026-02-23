@@ -269,6 +269,13 @@ class BaseMiner:
         Collects odds for all markets, then submits in batches to reduce
         network overhead. Batch size is configurable via config.batch_size.
         """
+        # Try a fresh sync each cycle so new miners produce submissions quickly.
+        try:
+            if hasattr(self.game_sync, "sync_once"):
+                await self.game_sync.sync_once()
+        except Exception as e:
+            bt.logging.debug({"base_miner": "game_sync_failed", "error": str(e)})
+
         # Get active markets from game sync
         markets = await self.game_sync.get_active_markets()
         

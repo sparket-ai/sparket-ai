@@ -78,6 +78,7 @@ class LedgerSync:
         self.latest_deltas: list[DeltaWindow] = []
 
         self._load_state()
+        self._prune_recompute_history()
 
     # -- State persistence --
 
@@ -131,6 +132,12 @@ class LedgerSync:
                 pass
             raise
 
+    def _prune_recompute_history(self) -> None:
+        """Keep recompute history bounded for long-running processes."""
+        if len(self.recompute_history) <= 256:
+            return
+        self.recompute_history = self.recompute_history[-256:]
+
     # -- Sync cycle --
 
     async def sync_cycle(self) -> tuple[CheckpointWindow | None, list[DeltaWindow]]:
@@ -144,7 +151,7 @@ class LedgerSync:
         # Fetch latest checkpoint
         cp = await self.store.get_latest_checkpoint()
         if cp is None:
-            bt.logging.debug({"auditor_sync": "no_checkpoint_available"})
+            bt.logging.info({"auditor_sync": "no_checkpoint_available"})
             return None, []
 
         self.latest_checkpoint = cp
@@ -239,6 +246,7 @@ class LedgerSync:
                 reason_code=record.reason_code.value if hasattr(record.reason_code, 'value') else str(record.reason_code),
                 reason_detail=record.reason_detail,
             ))
+            self._prune_recompute_history()
             bt.logging.warning({
                 "auditor_epoch_change": {
                     "new_epoch": new_epoch,

@@ -7,7 +7,7 @@ Supports delta sync to minimize data transfer for established miners.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 import bittensor as bt
@@ -54,11 +54,21 @@ _SELECT_LAST_SYNC = text(
 
 _SELECT_ACTIVE_MARKETS = text(
     """
-    SELECT m.market_id, m.event_id, m.kind, m.line, e.start_time_utc
+    SELECT
+        m.market_id,
+        m.event_id,
+        m.kind,
+        m.line,
+        e.start_time_utc,
+        e.home_team,
+        e.away_team,
+        e.league,
+        e.sport
     FROM market m
     JOIN event e ON e.event_id = m.event_id
     WHERE e.status = 'scheduled'
       AND e.start_time_utc > :now
+      AND e.start_time_utc <= :window_end
     ORDER BY e.start_time_utc ASC
     """
 )
@@ -79,10 +89,12 @@ class GameDataSync:
         database: Any,
         client: ValidatorClient,
         sync_interval_seconds: int = 300,
+        odds_window_days: int = 7,
     ) -> None:
         self.database = database
         self.client = client
         self.sync_interval = sync_interval_seconds
+        self.odds_window_days = max(1, int(odds_window_days))
         self._last_sync_ts: Optional[datetime] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -188,10 +200,11 @@ class GameDataSync:
     async def get_active_markets(self) -> List[Dict[str, Any]]:
         """Get all active markets available for pricing."""
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        window_end = now + timedelta(days=self.odds_window_days)
         try:
             rows = await self.database.read(
                 _SELECT_ACTIVE_MARKETS,
-                params={"now": now},
+                params={"now": now, "window_end": window_end},
                 mappings=True,
             )
             return [
@@ -201,6 +214,10 @@ class GameDataSync:
                     "kind": str(r["kind"]),
                     "line": float(r["line"]) if r.get("line") else None,
                     "start_time_utc": r["start_time_utc"],
+                    "home_team": r.get("home_team"),
+                    "away_team": r.get("away_team"),
+                    "league": r.get("league"),
+                    "sport": r.get("sport"),
                 }
                 for r in rows
             ]

@@ -36,7 +36,6 @@ from sparket.config import sanitize_dict
 from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
 from sparket.validator.comms import ValidatorComms
 from sparket.validator.handlers.handlers import Handlers
-from sparket.validator.services import SportsDataIngestor
 from sparket.validator.utils.runtime import next_backoff_delay, resolve_loop_timeouts
 from sparket.validator.utils.startup import (
     check_python_requirements,
@@ -99,16 +98,6 @@ class BaseValidatorNeuron(BaseNeuron):
         self.thread: Union[threading.Thread, None] = None
         self.lock = asyncio.Lock()
 
-        # SportsDataIO ingestor (initialized during component setup)
-        self.sdio_ingestor: SportsDataIngestor | None = None
-        
-        # Background SDIO ingest task management
-        self._sdio_ingest_running: bool = False
-        self._sdio_ingest_task: asyncio.Task | None = None
-
-        # Observability: track process start time for uptime gauge
-        self._start_time: float = time.time()
-
         # Initialize validator components (database, security_manager, etc.)
         # MUST happen before serve_axon() so security middleware can be injected
         self.initialize_components()
@@ -168,21 +157,6 @@ class BaseValidatorNeuron(BaseNeuron):
         except Exception as e:
             bt.logging.warning({"validator_context": {"worker_shutdown_error": str(e)}})
 
-        # Stop SDIO background ingest task
-        try:
-            self._sdio_ingest_running = False
-            task = getattr(self, "_sdio_ingest_task", None)
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    loop = getattr(self, "loop", None)
-                    if loop and not loop.is_closed():
-                        loop.run_until_complete(task)
-                except asyncio.CancelledError:
-                    pass
-        except Exception as e:
-            bt.logging.warning({"validator_context": {"sdio_task_cancel_error": str(e)}})
-
         # Cancel any running broadcast task and close its dendrite
         try:
             broadcaster = getattr(self, "_broadcaster", None)
@@ -193,14 +167,6 @@ class BaseValidatorNeuron(BaseNeuron):
                     loop.run_until_complete(broadcaster.close())
         except Exception as e:
             bt.logging.warning({"validator_context": {"broadcaster_cancel_error": str(e)}})
-
-        try:
-            ingestor = getattr(self, "sdio_ingestor", None)
-            loop = getattr(self, "loop", None)
-            if ingestor is not None and loop and not loop.is_closed():
-                loop.run_until_complete(ingestor.close())
-        except Exception as e:
-            bt.logging.warning({"validator_context": {"sdio_ingestor_close_error": str(e)}})
 
         # Stop ledger HTTP server
         try:
@@ -283,19 +249,6 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.info({"validator_init": {"step": "creating_dbm"}})
             self.dbm = DBM.get_manager(self.app_config)
             bt.logging.info({"validator_init": {"step": "dbm_created"}})
-
-            try:
-                self.sdio_ingestor = SportsDataIngestor(database=self.dbm)
-                bt.logging.info({"validator_init": {"step": "sdio_ingestor_initialized"}})
-                # Initialize from DB to avoid re-fetching on restart
-                restored = self.loop.run_until_complete(self.sdio_ingestor.initialize_from_db())
-                bt.logging.info({"validator_init": {"step": "sdio_ingestor_restored_from_db", "events": restored}})
-                # Start background ingest task (runs independently of main loop)
-                self._start_sdio_ingest_background()
-                bt.logging.info({"validator_init": {"step": "sdio_background_ingest_started"}})
-            except Exception as e:
-                self.sdio_ingestor = None
-                bt.logging.warning({"validator_init": {"sdio_ingestor_init_error": str(e)}})
 
             # Environment checks (best-effort)
             try:
@@ -712,122 +665,70 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.warning({"connection_push_error": str(e)})
 
     # -------------------------------------------------------------------------
-    # Background SDIO Ingest
+    # Ledger Export (decoupled from scoring path)
     # -------------------------------------------------------------------------
-    
-    def _start_sdio_ingest_background(self) -> None:
-        """Start the SDIO ingest as a background task.
-        
-        Runs independently of the main loop to avoid blocking.
-        Uses its own cadence and error handling.
+
+    _ledger_export_step_interval: int = 25  # same cadence as main scoring
+    _last_ledger_export_step: int = -1
+
+    async def _run_ledger_export_if_due(self) -> None:
+        """Export ledger checkpoint + delta if enabled and due.
+
+        Runs independently of the scoring execution path (in-process vs worker)
+        so that auditors always have fresh data.
         """
-        if self.sdio_ingestor is None:
-            bt.logging.warning({"sdio_background": "ingestor_not_available"})
+        if not bool(os.environ.get("SPARKET_LEDGER__ENABLED", "").lower() in ("true", "1", "yes")):
             return
-        
-        if self._sdio_ingest_running:
-            bt.logging.debug({"sdio_background": "already_running"})
-            return
-        
-        self._sdio_ingest_running = True
-        self._sdio_ingest_task = asyncio.ensure_future(
-            self._sdio_ingest_loop(),
-            loop=self.loop,
-        )
-        bt.logging.info({"sdio_background": "started"})
-    
-    async def _sdio_ingest_loop(self) -> None:
-        """Background loop for SDIO provider ingestion.
-        
-        Runs continuously with configurable interval, independent of the main
-        validator loop. This prevents long ingestion operations from blocking
-        critical path operations like scoring and weight setting.
-        """
-        from datetime import datetime, timezone
-        
-        # Get interval from config (default 60 seconds)
-        interval_seconds = 60
+
+        # Same cadence as scoring
         try:
             timers = getattr(getattr(self.app_config, "core", None), "timers", None)
-            if timers is not None:
-                interval_seconds = max(30, int(getattr(timers, "sdio_ingest_interval_seconds", 60)))
+            interval = int(getattr(timers, "main_score_steps", 25)) if timers else 25
         except Exception:
-            pass
-        
+            interval = 25
+
+        if interval <= 0 or (self.step % interval != 0):
+            return
+
+        # Skip if we already exported this step
+        if self.step == self._last_ledger_export_step:
+            return
+        self._last_ledger_export_step = self.step
+
+        from sparket.validator.ledger.exporter import LedgerExporter
+        from sparket.validator.ledger.store.filesystem import FilesystemStore
+        from sqlalchemy import text
+
+        data_dir = os.environ.get("SPARKET_LEDGER__DATA_DIR", "sparket/data/ledger")
+        netuid = getattr(self.config, "netuid", 57)
+
+        exporter = LedgerExporter(database=self.dbm, wallet=self.wallet, netuid=netuid)
+        store = FilesystemStore(data_dir=data_dir)
+
+        # Always export checkpoint (accumulator state from DB)
+        checkpoint = await exporter.export_checkpoint()
+        await store.put_checkpoint(checkpoint)
+
+        # Export delta if there are new settled outcomes since last delta
+        rows = await self.dbm.read(
+            text("SELECT last_delta_at FROM ledger_state WHERE id = 1"),
+            mappings=True,
+        )
+        last_delta_at = rows[0]["last_delta_at"] if rows else None
+
+        from datetime import datetime, timezone, timedelta
+        since = last_delta_at or (datetime.now(timezone.utc) - timedelta(hours=12))
+        delta = await exporter.export_delta(since=since)
+        if delta.settled_submissions:
+            await store.put_delta(delta)
+
         bt.logging.info({
-            "sdio_background_loop": {
-                "interval_seconds": interval_seconds,
-                "status": "starting",
+            "ledger_export": {
+                "step": self.step,
+                "checkpoint_miners": len(checkpoint.accumulators),
+                "delta_submissions": len(delta.settled_submissions),
             }
         })
-        
-        consecutive_errors = 0
-        max_consecutive_errors = 5
-        error_backoff = 30  # Additional wait on errors
-        
-        while self._sdio_ingest_running:
-            cycle_start = datetime.now(timezone.utc)
-            try:
-                if self.sdio_ingestor is not None:
-                    await self.sdio_ingestor.run_once(now=cycle_start)
-                    
-                    # Also run provider closing upserts
-                    from sparket.validator.handlers.ingest.provider_ingest import upsert_provider_closing
-                    from sparket.providers.providers import get_provider_id
-                    
-                    provider_id = get_provider_id("SDIO")
-                    if provider_id:
-                        try:
-                            upserts = await upsert_provider_closing(
-                                database=self.dbm,
-                                provider_id=provider_id,
-                                close_ts=cycle_start,
-                            )
-                            if upserts:
-                                bt.logging.debug({"sdio_background_closing_upserts": upserts})
-                        except Exception as exc:
-                            bt.logging.warning({"sdio_background_closing_error": str(exc)})
-                
-                consecutive_errors = 0  # Reset on success
-                
-            except asyncio.CancelledError:
-                bt.logging.info({"sdio_background_loop": "cancelled"})
-                break
-            except Exception as e:
-                consecutive_errors += 1
-                bt.logging.warning({
-                    "sdio_background_error": str(e),
-                    "consecutive_errors": consecutive_errors,
-                })
-                
-                if consecutive_errors >= max_consecutive_errors:
-                    bt.logging.error({
-                        "sdio_background_loop": "too_many_errors",
-                        "stopping": True,
-                    })
-                    break
-                
-                # Extra backoff on error
-                await asyncio.sleep(error_backoff)
-            
-            # Calculate time taken and sleep for remainder of interval
-            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
-            sleep_time = max(1, interval_seconds - elapsed)
-            
-            bt.logging.debug({
-                "sdio_background_cycle": {
-                    "elapsed_seconds": round(elapsed, 1),
-                    "sleep_seconds": round(sleep_time, 1),
-                }
-            })
-            
-            try:
-                await asyncio.sleep(sleep_time)
-            except asyncio.CancelledError:
-                break
-        
-        self._sdio_ingest_running = False
-        bt.logging.info({"sdio_background_loop": "stopped"})
 
     def run(self):
         """
@@ -982,10 +883,26 @@ class BaseValidatorNeuron(BaseNeuron):
                         bt.logging.warning({"validator_loop": {"phase": "scoring_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "scoring_complete"}})
 
-                    # NOTE: Provider ingest (SDIO) now runs in background task
-                    # See _sdio_ingest_loop() - started during initialize_components()
+                    # NOTE: Provider ingest (SDIO) runs as a separate PM2 process
+                    # See sparket/entrypoints/ingestor.py
 
+                    from sparket.validator.handlers.ingest.ingest_odds import run_odds_processing_if_due
                     from sparket.validator.handlers.ingest.outcome_processor import run_outcome_processing_if_due
+
+                    bt.logging.debug({"validator_loop": {"phase": "odds_process_start"}})
+                    try:
+                        self.loop.run_until_complete(
+                            asyncio.wait_for(
+                                run_odds_processing_if_due(
+                                    validator=self,
+                                    database=self.dbm,
+                                ),
+                                timeout=timeouts["outcome"],
+                            )
+                        )
+                    except asyncio.TimeoutError:
+                        bt.logging.warning({"validator_loop": {"phase": "odds_process_timeout"}})
+                    bt.logging.debug({"validator_loop": {"phase": "odds_process_complete"}})
 
                     bt.logging.debug({"validator_loop": {"phase": "outcome_process_start"}})
                     try:
@@ -1002,6 +919,21 @@ class BaseValidatorNeuron(BaseNeuron):
                     except asyncio.TimeoutError:
                         bt.logging.warning({"validator_loop": {"phase": "outcome_process_timeout"}})
                     bt.logging.debug({"validator_loop": {"phase": "outcome_process_complete"}})
+
+                    # Ledger export (independent of scoring path)
+                    bt.logging.debug({"validator_loop": {"phase": "ledger_export_start"}})
+                    try:
+                        self.loop.run_until_complete(
+                            asyncio.wait_for(
+                                self._run_ledger_export_if_due(),
+                                timeout=timeouts.get("scoring", 120),
+                            )
+                        )
+                    except asyncio.TimeoutError:
+                        bt.logging.warning({"validator_loop": {"phase": "ledger_export_timeout"}})
+                    except Exception as e:
+                        bt.logging.warning({"validator_loop": {"ledger_export_error": str(e)}})
+                    bt.logging.debug({"validator_loop": {"phase": "ledger_export_complete"}})
 
                     from sparket.validator.handlers.maintenance.cleanup import run_cleanup_if_due
 

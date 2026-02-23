@@ -3,6 +3,36 @@
 This guide covers setup and usage for a Sparket miner. Miners generate
 odds and outcomes and submit them to validators for scoring.
 
+## Critical warning before you register
+
+Do **not** assume that running the out-of-the-box base miner is a profitable
+strategy. It is a reference implementation only.
+
+If you run the default base miner without building your own data pipeline and
+modeling logic, you should expect:
+- weak scoring relative to competitive miners,
+- high risk of eventual deregistration,
+- and a real risk of losing your registration fee.
+
+If you are not comfortable writing and maintaining custom code in this repo,
+you should **not** register a miner expecting sustained rewards.
+
+### Sparket mining interview (required for base miner)
+
+The base miner is now gated by a local operator challenge called the
+`Sparket mining interview`.
+
+Sparket mining interview version: v1
+
+- If you have not passed the interview, the miner process still runs, but the
+  base miner runtime is blocked and will not submit default odds/outcomes.
+- To unlock base miner runtime, read this document and run:
+  `python -m sparket.tools.mining_interview`
+- Interview attestations are invalidated when this document changes.
+
+Risk keywords used by the interview riddle:
+`weak_scoring`, `deregistration`, `fee_loss`
+
 ## What a miner does
 A miner:
 - Connects to the subnet and exposes an axon.
@@ -504,9 +534,15 @@ If your miner is running but validators cannot connect, re-check:
 - Any NAT or port forwarding rules
 
 ## How submissions are produced
-The miner uses `MinerService` to submit odds and outcomes on a cadence.
-It reads market IDs and event IDs from `miner.markets` and `miner.events`.
-Replace that pipeline with your own model or data source if desired.
+By default, the base miner does **not** require static `miner.markets` or
+`miner.events` lists. It continuously:
+1. Fetches games/markets from validators (`GAME_DATA_REQUEST`)
+2. Stores them in the local miner DB
+3. Generates odds for active markets in the validator odds window
+4. Submits odds/outcomes on cadence
+
+`miner.markets` and `miner.events` are only needed for custom pipelines using
+`MinerService`. The reference base miner pulls markets dynamically.
 
 ## Base miner (reference implementation)
 The repository includes a base miner that uses free or low-cost sources and
@@ -514,6 +550,20 @@ simple heuristics to generate odds. It is intentionally lightweight and
 serves as a reference implementation, not a competitive strategy. Expect it
 to perform poorly in the scoring system compared with miners that ingest
 better data and model the market more accurately.
+
+### Important risk disclosure
+
+The base miner exists to demonstrate the protocol flow, not to provide a
+production-grade edge. Running it unchanged is very likely to underperform
+against serious miners over time.
+
+Read this as a direct warning:
+- Default base-miner submissions are usually not competitive.
+- Persistent poor scoring can lead to deregistration.
+- Deregistration can make your registration spend a sunk cost.
+
+To run the reference base miner at all, you must pass:
+`python -m sparket.tools.mining_interview`
 
 The base miner is **enabled by default** and will start automatically when
 you run the miner. If you want to replace it with your own service, disable it:
@@ -622,12 +672,20 @@ Look for:
 ```
 Where N > 0. If N is 0, the validator may still be initializing or there may be no upcoming games.
 
+You should also see sync logs from the local game cache:
+```json
+{"game_data_sync": {"status": "success", "games_synced": N, "markets_synced": M}}
+```
+
 ### Step 4: Odds Submitted
 Look for the new batched submission log:
 ```json
 {"base_miner_odds_cycle": {"markets": 50, "batches": 1, "submitted": 50, "skipped": 0}}
 ```
 The `submitted` count should be > 0.
+
+If `markets` is 0 for many cycles, check that games are within the validator
+odds acceptance window (default 7 days before event start).
 
 ### Step 5: No Persistent Errors
 Check recent logs for recurring errors:

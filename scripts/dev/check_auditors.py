@@ -31,7 +31,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check auditor validator weight health")
-    bt.subtensor.add_args(parser)
+    bt.Subtensor.add_args(parser)
     parser.add_argument("--netuid", type=int, default=57, help="Subnet UID")
     parser.add_argument("--primary-uid", type=int, default=None, help="Primary validator UID (auto-detected if omitted)")
     parser.add_argument("--primary-hotkey", type=str, default=None, help="Primary validator hotkey (for auto-detection)")
@@ -44,7 +44,7 @@ def main() -> None:
     drift_threshold = config.drift_threshold
 
     print(f"Connecting to subtensor (netuid={netuid})...")
-    subtensor = bt.subtensor(config=config)
+    subtensor = bt.Subtensor(config=config)
     metagraph = subtensor.metagraph(netuid=netuid)
     current_block = subtensor.block
 

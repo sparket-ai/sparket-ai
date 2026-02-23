@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import bittensor as bt
@@ -20,14 +22,19 @@ from sparket.providers.sportsdataio import (
     map_moneyline_quotes,
     map_spread_quotes,
     map_total_quotes,
-    resolve_moneyline_result,
     resolve_spread_result,
     resolve_total_result,
 )
-from sparket.providers.sportsdataio.catalog import team_rows_from_catalog, build_team_index_by_sdio
+from sparket.providers.sportsdataio.catalog import team_rows_from_catalog
 from sparket.providers.sportsdataio.enums import GameStatus
 from sparket.providers.sportsdataio.types import Game, GameOdds, GameOddsSet, Team
-from sparket.validator.database.resolver import ensure_event_for_sdio, ensure_market
+from sparket.validator.database.resolver import (
+    ensure_event_for_sdio,
+    ensure_market,
+    ensure_markets_batch,
+    _market_key,
+    MarketKey,
+)
 from sparket.validator.handlers.ingest.provider_ingest import insert_provider_quotes, upsert_provider_closing_for_event
 from sparket.shared.rows import ProviderQuoteRow
 
@@ -36,6 +43,15 @@ from sparket.shared.rows import ProviderQuoteRow
 _UPDATE_EVENT_STATUS = text("""
     UPDATE event SET status = :status
     WHERE event_id = :event_id AND status != :status
+""")
+
+_PATCH_EVENT_TEAMS = text("""
+    UPDATE event
+    SET
+        home_team_id = COALESCE(home_team_id, :home_team_id),
+        away_team_id = COALESCE(away_team_id, :away_team_id)
+    WHERE event_id = :event_id
+      AND (home_team_id IS NULL OR away_team_id IS NULL)
 """)
 
 _SELECT_MARKETS_FOR_EVENT = text("""
@@ -60,8 +76,8 @@ _CHECK_OUTCOME_EXISTS = text("""
 """)
 
 _UPSERT_SPORTSBOOK = text("""
-    INSERT INTO sportsbook (provider_id, code, name, is_sharp, active)
-    VALUES (:provider_id, :code, :name, false, true)
+    INSERT INTO sportsbook (provider_id, code, name, is_sharp, active, created_at)
+    VALUES (:provider_id, :code, :name, false, true, NOW())
     ON CONFLICT (code) DO NOTHING
     RETURNING sportsbook_id
 """)
@@ -71,8 +87,8 @@ _SELECT_SPORTSBOOK_CODES = text("""
 """)
 
 _SEED_SPORTSBOOK_BIAS = text("""
-    INSERT INTO sportsbook_bias (sportsbook_id, sport_id, market_kind, bias_factor, variance, sample_count, version)
-    SELECT :sportsbook_id, s.sport_id, mk.kind, 1.0, 0.01, 0, 1
+    INSERT INTO sportsbook_bias (sportsbook_id, sport_id, market_kind, bias_factor, variance, sample_count, version, computed_at)
+    SELECT :sportsbook_id, s.sport_id, mk.kind::market_kind, 1.0, 0.01, 0, 1, NOW()
     FROM sport s
     CROSS JOIN (VALUES ('MONEYLINE'), ('SPREAD'), ('TOTAL')) AS mk(kind)
     ON CONFLICT DO NOTHING
@@ -114,6 +130,15 @@ class OddsCacheEntry:
 
 
 TrackedKey = Tuple[LeagueCode, int]
+FINAL_GAME_STATUSES = {
+    GameStatus.FINAL,
+    GameStatus.FINAL_OT,
+    GameStatus.FINAL_SO,
+    GameStatus.FINAL_AET,
+    GameStatus.FINAL_PEN,
+    GameStatus.AWARDED,
+    GameStatus.FORFEIT,
+}
 
 
 class SportsDataIngestor:
@@ -125,6 +150,9 @@ class SportsDataIngestor:
       - Track upcoming events and ensure markets exist
       - Capture odds snapshots / delta feeds with adaptive cadence
     """
+
+    POST_START_CUTOFF_DAYS = 5
+    MAX_CONCURRENT_SNAPSHOTS = 8
 
     def __init__(
         self,
@@ -144,6 +172,9 @@ class SportsDataIngestor:
         }
         self.tracked_events: Dict[TrackedKey, TrackedEvent] = {}
         self._odds_cache: Dict[Tuple[LeagueCode, int], OddsCacheEntry] = {}
+        self._outcome_score_missing_logged: Set[int] = set()
+        self._known_sportsbook_codes: Optional[Set[str]] = None
+        self._market_id_cache: Dict[Tuple[int, MarketKey], int] = {}
 
     async def close(self) -> None:
         self._odds_cache.clear()
@@ -249,6 +280,10 @@ class SportsDataIngestor:
 
         now = now or datetime.now(timezone.utc)
         self._evict_expired_cache(now)
+        cycle_start = now
+        total_snapshots = 0
+        total_errors = 0
+        leagues_processed = 0
         for league_code, state in self.leagues.items():
             metrics: Dict[str, Any] = {
                 "league": league_code.value,
@@ -268,8 +303,11 @@ class SportsDataIngestor:
                 if state.next_schedule_refresh <= now:
                     metrics["schedule_games"] = await self._refresh_schedule(state, now)
                 await self._refresh_odds(state, now, metrics=metrics)
-            except Exception as exc:  # pragma: no cover - defensive boundary
+                leagues_processed += 1
+                total_snapshots += metrics["snapshot_success"]
+            except Exception as exc:
                 metrics["error"] = str(exc)
+                total_errors += 1
                 PROVIDER_ERRORS.labels(endpoint=f"sdio/{league_code.value}").inc()
                 bt.logging.warning({"sdio_ingestor_error": str(exc), "league": league_code.value})
             finally:
@@ -277,6 +315,16 @@ class SportsDataIngestor:
                     _obs_time.monotonic() - _t0
                 )
                 bt.logging.info({"sdio_ingestor_league": metrics})
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        bt.logging.info({
+            "sdio_cycle_complete": {
+                "leagues": leagues_processed,
+                "snapshots": total_snapshots,
+                "errors": total_errors,
+                "elapsed_seconds": round(elapsed, 1),
+                "total_tracked": len(self.tracked_events),
+            }
+        })
 
         # Update active event/market gauges
         EVENTS_ACTIVE.set(len(self.tracked_events))
@@ -340,16 +388,77 @@ class SportsDataIngestor:
     async def _load_team_index(self, league_id: int) -> Dict[str, int]:
         query = text(
             """
-            select team_id, ext_ref->'sportsdataio'->>'Key' as team_key
+            select
+                team_id,
+                name,
+                ext_ref->'sportsdataio'->>'Key' as team_key,
+                ext_ref->'sportsdataio'->>'TeamID' as team_sdio_id
             from team
             where league_id = :league_id
             """
         )
         rows = await self.database.read(query, params={"league_id": league_id}, mappings=True)
-        rows = [{"team_id": r["team_id"], "ext_ref": {"sportsdataio": {"Key": r["team_key"]}}} for r in rows if r.get("team_key")]
-        return build_team_index_by_sdio(rows)
+        index: Dict[str, int] = {}
+        for row in rows:
+            team_id = int(row["team_id"])
+            aliases = (
+                row.get("team_key"),
+                row.get("name"),
+                row.get("team_sdio_id"),
+            )
+            for alias in aliases:
+                if alias is None:
+                    continue
+                key = str(alias).strip()
+                if not key:
+                    continue
+                index.setdefault(key, team_id)
+                index.setdefault(key.casefold(), team_id)
+        return index
+
+    @staticmethod
+    def _resolve_team_id(team_index: Dict[str, int], team_ref: Optional[str]) -> Optional[int]:
+        if team_ref is None:
+            return None
+        token = str(team_ref).strip()
+        if not token:
+            return None
+        return team_index.get(token) or team_index.get(token.casefold())
+
+    async def _patch_event_teams(
+        self,
+        event_id: int,
+        home_team_id: Optional[int],
+        away_team_id: Optional[int],
+    ) -> None:
+        if home_team_id is None and away_team_id is None:
+            return
+        await self.database.write(
+            _PATCH_EVENT_TEAMS,
+            params={
+                "event_id": event_id,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+            },
+        )
 
     async def _refresh_schedule(self, state: LeagueState, now: datetime) -> int:
+        # Off-season skip: avoid wasting API calls when no games are upcoming
+        if (
+            state.config.off_season_months
+            and now.month in state.config.off_season_months
+            and not await self._has_upcoming_events(state, now)
+        ):
+            bt.logging.info({
+                "sdio_schedule_skip": {
+                    "league": state.config.code.value,
+                    "reason": "off_season",
+                    "month": now.month,
+                }
+            })
+            state.next_schedule_refresh = now + timedelta(hours=6)
+            return 0
+
         if state.config.schedule_mode == "season":
             games = await self._fetch_schedule_season(state, now)
         else:
@@ -360,46 +469,65 @@ class SportsDataIngestor:
             state.team_index = team_index
         start_cutoff = now - timedelta(days=1)
         end_cutoff = now + timedelta(days=state.config.track_days_ahead)
+        stale_cutoff = now - timedelta(days=self.POST_START_CUTOFF_DAYS)
         total_upserts = 0
         tracked = 0
         status_updates = 0
         outcomes_recorded = 0
+        skipped = 0
         for game in games:
             if not game.date_time:
                 continue
+
+            # Fast filter: skip games outside our processing window entirely.
+            # Avoids thousands of pointless DB round-trips for full-season fetches.
+            game_start = game.date_time
+            if game_start.tzinfo is None:
+                game_start = game_start.replace(tzinfo=timezone.utc)
+            if game_start < stale_cutoff or game_start > end_cutoff:
+                skipped += 1
+                continue
+
             event_id, start_time, home_id, away_id = await self._upsert_event(state, game, team_index)
             total_upserts += 1
-            
-            # Sync event status and record outcomes for finished games
+
             try:
                 updated = await self._sync_event_status(event_id, game, now)
                 if updated:
                     status_updates += 1
-                # Record outcomes for final games regardless of status change
-                # (_record_outcomes has idempotency guards via _CHECK_OUTCOME_EXISTS)
                 if self._is_game_final(game):
-                    recorded = await self._record_outcomes(event_id, game, home_id, away_id)
+                    resolved_home, resolved_away = await self._resolve_final_scores(state, game, now)
+                    recorded = await self._record_outcomes(
+                        event_id,
+                        game,
+                        home_id,
+                        away_id,
+                        home_score_override=resolved_home,
+                        away_score_override=resolved_away,
+                    )
                     outcomes_recorded += recorded
             except Exception as e:
                 bt.logging.warning({"sdio_status_sync_error": str(e), "event_id": event_id})
-            
+
             should_track = start_cutoff <= start_time <= end_cutoff
             key = self._tracked_key(state.config.code, game.game_id)
-            # Don't track finished games for odds - they're done
             if should_track and not self._is_game_final(game):
                 self._ensure_tracked_event(state, game, event_id, start_time, home_id, away_id)
                 tracked += 1
             else:
                 self.tracked_events.pop(key, None)
-        
-        if status_updates > 0 or outcomes_recorded > 0:
-            bt.logging.info({
-                "sdio_lifecycle_sync": {
-                    "league": state.config.code.value,
-                    "status_updates": status_updates,
-                    "outcomes_recorded": outcomes_recorded,
-                }
-            })
+
+        bt.logging.info({
+            "sdio_schedule_refresh": {
+                "league": state.config.code.value,
+                "api_games": len(games),
+                "processed": total_upserts,
+                "tracked": tracked,
+                "skipped": skipped,
+                "status_updates": status_updates,
+                "outcomes_recorded": outcomes_recorded,
+            }
+        })
         state.next_schedule_refresh = now + timedelta(minutes=state.config.schedule_refresh_minutes)
         return total_upserts
 
@@ -408,20 +536,24 @@ class SportsDataIngestor:
         end = date.fromordinal(start.toordinal() + state.config.track_days_ahead)
         return await self.client.fetch_schedule_window(state.config, start, end)
 
+    async def _has_upcoming_events(self, state: LeagueState, now: datetime) -> bool:
+        """Check DB for any upcoming scheduled events in this league."""
+        rows = await self.database.read(
+            text("""
+                SELECT 1 FROM event
+                WHERE league_id = :league_id
+                  AND status = 'scheduled'
+                  AND start_time_utc > :now
+                LIMIT 1
+            """),
+            params={"league_id": state.league_id, "now": now},
+        )
+        return bool(rows)
+
     async def _fetch_schedule_season(self, state: LeagueState, now: datetime) -> List[Game]:
-        year = self._compute_season_year(now, state.config)
-        fmt = state.config.season_format or "{year}"
-        
-        # Support multiple season types (e.g., ["REG", "POST"] for NFL)
-        season_types = state.config.season_types
-        if not season_types:
-            # Fallback to single season_type for backwards compatibility
-            season_types = [state.config.season_type or ""]
-        
+        seasons = self._compute_active_seasons(now, state.config)
         all_games: List[Game] = []
-        for season_type in season_types:
-            season_type = (season_type or "").upper()
-            season_code = fmt.format(year=year, season_type=season_type, SEASONTYPE=season_type, YEAR=year)
+        for season_code, season_type in seasons:
             try:
                 games = await self.client.fetch_schedule_season(
                     state.config,
@@ -446,42 +578,60 @@ class SportsDataIngestor:
                 })
         return all_games
 
-    def _compute_season_year(self, now: datetime, config: LeagueConfig) -> int:
-        """
-        Compute the correct season year for leagues with cross-calendar seasons.
-        
-        For NBA/NHL (offset=1, Oct-Jun seasons, uses ENDING year):
-          - Jan-Jun: We're in the season ending this year (season = current year)
-          - Oct-Dec: We're in the season ending next year (season = current year + 1)
-          - Jul-Sep: Off-season, use next year's season
-        
-        For NFL (offset=-1, Sept-Feb season, uses STARTING year):
-          - Sept-Dec: New season just started (season = current year)
-          - Jan-Feb: Playoffs for previous year's season (season = current year - 1)
-          - Mar-Aug: Off-season, use current year for upcoming season
-        
-        For MLB (offset=0):
-          - Just use current year
-        """
+    @staticmethod
+    def _primary_season_year(now: datetime, config: LeagueConfig) -> int:
+        """Compute the primary season year from offset rules."""
         offset = int(config.season_year_offset or 0)
-        
         if offset == 0:
-            # MLB: Calendar year leagues
             return now.year
         elif offset == -1:
-            # NFL: Season uses starting year (Sept 2025 → Feb 2026 = "2025" season)
-            if now.month <= 2:  # Jan-Feb: still in last year's season (playoffs)
-                return now.year - 1
-            else:  # Mar-Dec: use current year
-                return now.year
+            return now.year - 1 if now.month <= 2 else now.year
         else:
-            # NBA/NHL (offset=1): Season uses ending year
-            if now.month >= 10:  # Oct, Nov, Dec - new season has started
-                return now.year + 1
-            elif now.month <= 6:  # Jan-Jun - still in this year's season
-                return now.year
-            else:  # Jul-Sep - off-season, prepare for upcoming season
-                return now.year + 1
+            return now.year + 1 if now.month >= 10 else now.year
+
+    @staticmethod
+    def _adjacent_season_year(primary: int, config: LeagueConfig) -> int:
+        """Compute the adjacent season year for transition periods."""
+        offset = int(config.season_year_offset or 0)
+        if offset == -1:
+            return primary + 1
+        else:
+            return primary + 1 if offset >= 1 else primary + 1
+
+    @staticmethod
+    def _compute_active_seasons(
+        now: datetime, config: LeagueConfig,
+    ) -> List[Tuple[str, Optional[str]]]:
+        """Return a list of (season_code, season_type) pairs to fetch.
+
+        Handles:
+        - Multiple season types (e.g., PRE/REG/POST for NFL)
+        - Transition months: fetches both current and adjacent season
+        - Normal months: fetches current season only
+        """
+        fmt = config.season_format or "{year}"
+        season_types = config.season_types
+        if not season_types:
+            season_types = [config.season_type or ""]
+
+        primary_year = SportsDataIngestor._primary_season_year(now, config)
+
+        years = [primary_year]
+        if config.transition_months and now.month in config.transition_months:
+            adj = SportsDataIngestor._adjacent_season_year(primary_year, config)
+            if adj != primary_year:
+                years.append(adj)
+
+        pairs: List[Tuple[str, Optional[str]]] = []
+        for year in years:
+            for st in season_types:
+                st_upper = (st or "").upper()
+                code = fmt.format(
+                    year=year, season_type=st_upper,
+                    SEASONTYPE=st_upper, YEAR=year,
+                )
+                pairs.append((code, st_upper or None))
+        return pairs
 
     async def _upsert_event(
         self,
@@ -491,10 +641,11 @@ class SportsDataIngestor:
     ) -> Tuple[int, datetime, Optional[int], Optional[int]]:
         if not game.date_time:
             raise ValueError("game missing date_time")
-        home_id = team_index.get(game.home_team)
-        away_id = team_index.get(game.away_team)
+        home_id = self._resolve_team_id(team_index, game.home_team)
+        away_id = self._resolve_team_id(team_index, game.away_team)
         event_row = map_game_to_event(game, league_id=state.league_id, home_team_id=home_id, away_team_id=away_id)
         event_id, start_time = await ensure_event_for_sdio(self.database, event_row)
+        await self._patch_event_teams(event_id, home_id, away_id)
         if start_time.tzinfo is None:
             start_time = start_time.replace(tzinfo=timezone.utc)
         return event_id, start_time, home_id, away_id
@@ -506,11 +657,23 @@ class SportsDataIngestor:
         """Check if game is in a final/completed state."""
         if game.status is None:
             return False
-        return game.status in (
-            GameStatus.FINAL,
-            GameStatus.FINAL_OT,
-            GameStatus.FINAL_SO,
-        )
+        return game.status in FINAL_GAME_STATUSES
+
+    async def _resolve_final_scores(
+        self,
+        state: LeagueState,
+        game: Game,
+        now: datetime,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        if game.home_score is not None and game.away_score is not None:
+            return game.home_score, game.away_score
+        try:
+            odds_set = await self._get_line_history_for_event(state, game.game_id, now, tracked=None)
+        except Exception:
+            return game.home_score, game.away_score
+        if odds_set is None:
+            return game.home_score, game.away_score
+        return odds_set.home_score, odds_set.away_score
 
     def _game_status_to_event_status(self, game: Game) -> str:
         """Map SDIO game status to our event status."""
@@ -522,6 +685,10 @@ class SportsDataIngestor:
             GameStatus.FINAL: "finished",
             GameStatus.FINAL_OT: "finished",
             GameStatus.FINAL_SO: "finished",
+            GameStatus.FINAL_AET: "finished",
+            GameStatus.FINAL_PEN: "finished",
+            GameStatus.AWARDED: "finished",
+            GameStatus.FORFEIT: "finished",
             GameStatus.POSTPONED: "postponed",
             GameStatus.CANCELED: "canceled",
         }
@@ -551,19 +718,29 @@ class SportsDataIngestor:
         game: Game,
         home_team_id: Optional[int],
         away_team_id: Optional[int],
+        *,
+        home_score_override: Optional[int] = None,
+        away_score_override: Optional[int] = None,
     ) -> int:
         """Record outcomes for all markets of a finished game. Returns count recorded."""
-        if game.home_score is None or game.away_score is None:
-            bt.logging.debug({
-                "sdio_outcome_skip": {
-                    "event_id": event_id,
-                    "reason": "scores_not_available",
-                }
-            })
+        missing_logged = getattr(self, "_outcome_score_missing_logged", None)
+        if missing_logged is None:
+            missing_logged = set()
+            self._outcome_score_missing_logged = missing_logged
+        home_score = game.home_score if home_score_override is None else home_score_override
+        away_score = game.away_score if away_score_override is None else away_score_override
+        if home_score is None or away_score is None:
+            if event_id not in missing_logged:
+                bt.logging.debug({
+                    "sdio_outcome_skip": {
+                        "event_id": event_id,
+                        "reason": "scores_not_available",
+                    }
+                })
+                missing_logged.add(event_id)
             return 0
 
-        home_score = game.home_score
-        away_score = game.away_score
+        missing_logged.discard(event_id)
         settled_at = datetime.now(timezone.utc)
 
         # Get all markets for this event
@@ -617,7 +794,7 @@ class SportsDataIngestor:
                     params={
                         "market_id": market_id,
                         "settled_at": settled_at,
-                        "result": result,
+                        "result": result.upper(),
                         "score_home": home_score,
                         "score_away": away_score,
                         "details": json.dumps({
@@ -670,7 +847,11 @@ class SportsDataIngestor:
         kind_upper = kind.upper() if kind else ""
 
         if kind_upper == "MONEYLINE":
-            return resolve_moneyline_result(home_score, away_score)
+            if home_score > away_score:
+                return "home"
+            if home_score < away_score:
+                return "away"
+            return "draw"
         elif kind_upper == "TOTAL" and line is not None:
             return resolve_total_result(line, home_score, away_score)
         elif kind_upper == "SPREAD" and line is not None:
@@ -714,13 +895,37 @@ class SportsDataIngestor:
         events = list(self._events_for_league(state.config.code))
         if metrics is not None:
             metrics["events_tracked"] = len(events)
+        stale_cutoff = now - timedelta(days=self.POST_START_CUTOFF_DAYS)
+        pending: List[TrackedEvent] = []
         for tracked in events:
-            if tracked.start_time <= now and tracked.post_start_polls_remaining <= 0:
+            if tracked.start_time < stale_cutoff:
+                self._finalize_tracked_event(state, tracked, reason="past_cutoff")
+            elif tracked.start_time <= now and tracked.post_start_polls_remaining <= 0:
                 self._finalize_tracked_event(state, tracked, reason="post_start_window_exhausted")
-                continue
-            if tracked.next_snapshot_at > now:
-                continue
-            await self._capture_snapshot(state, tracked, now, metrics=metrics)
+            elif tracked.next_snapshot_at <= now:
+                pending.append(tracked)
+
+        if not pending:
+            return
+
+        sem = asyncio.Semaphore(self.MAX_CONCURRENT_SNAPSHOTS)
+
+        async def _snap(t: TrackedEvent) -> None:
+            async with sem:
+                await self._capture_snapshot(state, t, now, metrics=metrics)
+
+        results = await asyncio.gather(
+            *(_snap(t) for t in pending), return_exceptions=True,
+        )
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                bt.logging.warning({
+                    "sdio_snapshot_error": {
+                        "league": state.config.code.value,
+                        "game_id": int(pending[i].game_id),
+                        "error": str(result),
+                    }
+                })
 
     def _events_for_league(self, league_code: LeagueCode) -> Iterable[TrackedEvent]:
         return [ev for ev in self.tracked_events.values() if ev.league_code == league_code]
@@ -772,16 +977,6 @@ class SportsDataIngestor:
             return None
         if metrics is not None:
             metrics["snapshot_success"] += 1
-        bt.logging.debug(
-            {
-                "sdio_snapshot_success": {
-                    "league": state.config.code.value,
-                    "game_id": int(tracked.game_id),
-                    "watermark": self._ts(tracked.last_history_ts),
-                    "seen_ids": len(tracked.seen_odd_ids),
-                }
-            }
-        )
         tracked.next_snapshot_at = now + self._next_snapshot_interval(state, tracked, now)
         if tracked.start_time <= now:
             if not tracked.closing_captured:
@@ -931,6 +1126,10 @@ class SportsDataIngestor:
         key = self._tracked_key(tracked.league_code, tracked.game_id)
         self.tracked_events.pop(key, None)
         self._odds_cache.pop((tracked.league_code, tracked.game_id), None)
+        # Evict market ID cache entries for this event
+        stale_keys = [k for k in self._market_id_cache if k[0] == tracked.event_id]
+        for k in stale_keys:
+            self._market_id_cache.pop(k, None)
         bt.logging.info(
             {
                 "sdio_tracked_event_finalized": {
@@ -949,21 +1148,23 @@ class SportsDataIngestor:
     async def _ensure_sportsbooks(self, fresh_odds: List[GameOdds]) -> None:
         """Register any new sportsbook codes found in fresh odds.
 
-        Upserts into sportsbook table and seeds sportsbook_bias with
-        neutral values for new entries. Idempotent via ON CONFLICT DO NOTHING.
+        Uses an in-memory cache to avoid querying the DB on every call.
+        Only hits the DB when genuinely new codes are discovered.
         """
         codes = {odds.sportsbook for odds in fresh_odds if odds.sportsbook}
         if not codes:
             return
 
-        # Fetch already-registered codes to skip redundant writes
-        existing_rows = await self.database.read(
-            _SELECT_SPORTSBOOK_CODES,
-            params={"provider_id": self.provider_id},
-            mappings=True,
-        )
-        existing_codes = {r["code"] for r in existing_rows}
-        new_codes = codes - existing_codes
+        # Lazy-load existing codes on first call
+        if self._known_sportsbook_codes is None:
+            existing_rows = await self.database.read(
+                _SELECT_SPORTSBOOK_CODES,
+                params={"provider_id": self.provider_id},
+                mappings=True,
+            )
+            self._known_sportsbook_codes = {r["code"] for r in existing_rows}
+
+        new_codes = codes - self._known_sportsbook_codes
         if not new_codes:
             return
 
@@ -973,6 +1174,7 @@ class SportsDataIngestor:
                 params={"provider_id": self.provider_id, "code": code, "name": code},
                 return_rows=True,
             )
+            self._known_sportsbook_codes.add(code)
             if rows:
                 sportsbook_id = rows[0][0]
                 await self.database.write(
@@ -986,6 +1188,30 @@ class SportsDataIngestor:
                     }
                 })
 
+    async def _resolve_markets_cached(
+        self, event_id: int, market_rows: List[dict],
+    ) -> Dict[MarketKey, int]:
+        """Resolve market IDs with a two-layer strategy: in-memory cache, then batch DB."""
+        uncached: List[dict] = []
+        result: Dict[MarketKey, int] = {}
+        for mrow in market_rows:
+            key = _market_key(mrow)
+            cache_key = (event_id, key)
+            if cache_key in self._market_id_cache:
+                result[key] = self._market_id_cache[cache_key]
+            else:
+                uncached.append(mrow)
+
+        if uncached:
+            from_db = await ensure_markets_batch(
+                self.database, uncached, event_id=event_id,
+            )
+            for key, mid in from_db.items():
+                result[key] = mid
+                self._market_id_cache[(event_id, key)] = mid
+
+        return result
+
     async def _persist_odds(self, state: LeagueState, tracked: TrackedEvent, odds_set: GameOddsSet) -> Optional[datetime]:
         fresh_odds = self._filter_new_pregame(tracked, odds_set)
         if not fresh_odds:
@@ -998,34 +1224,45 @@ class SportsDataIngestor:
                 }
             )
             return None
-        # Register any new sportsbook codes before inserting quotes
         await self._ensure_sportsbooks(fresh_odds)
-        quotes: List[ProviderQuoteRow] = []
-        provider_id = self.provider_id
+
+        # Collect all distinct market rows across fresh odds, then batch-resolve
+        all_market_rows: List[dict] = []
+        odds_market_rows: List[List[dict]] = []
         for odds in fresh_odds:
-            markets = ensure_markets_for_event(
+            rows = ensure_markets_for_event(
                 tracked.event_id,
                 spread_lines=self._extract_spread_lines(odds),
                 total_points_list=self._extract_total_points(odds),
                 home_team_id=tracked.home_team_id,
                 away_team_id=tracked.away_team_id,
             )
-            for market_row in markets:
-                market_id = await ensure_market(self.database, market_row, event_id=tracked.event_id)
+            odds_market_rows.append(rows)
+            all_market_rows.extend(rows)
+
+        resolved = await self._resolve_markets_cached(tracked.event_id, all_market_rows)
+
+        quotes: List[ProviderQuoteRow] = []
+        provider_id = self.provider_id
+        for odds, rows in zip(fresh_odds, odds_market_rows):
+            for mrow in rows:
+                key = _market_key(mrow)
+                market_id = resolved.get(key)
+                if market_id is None:
+                    continue
                 quotes.extend(self._map_quotes_for_market(odds, provider_id, market_id))
         if quotes:
             await insert_provider_quotes(database=self.database, quotes=quotes)
-        bt.logging.debug(
-            {
-                "sdio_history_persisted": {
-                    "league": state.config.code.value,
-                    "game_id": int(tracked.game_id),
-                    "quotes": len(quotes),
-                    "new_snapshots": len(fresh_odds),
-                    "sportsbooks": sorted({odds.sportsbook for odds in fresh_odds if odds.sportsbook}),
-                }
+        bt.logging.info({
+            "sdio_odds_persisted": {
+                "league": state.config.code.value,
+                "game_id": int(tracked.game_id),
+                "event_id": tracked.event_id,
+                "markets": len(resolved),
+                "quotes": len(quotes),
+                "snapshots": len(fresh_odds),
             }
-        )
+        })
         self._mark_history_processed(tracked, fresh_odds)
         return tracked.last_history_ts
 

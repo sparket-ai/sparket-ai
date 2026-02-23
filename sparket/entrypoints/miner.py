@@ -31,6 +31,7 @@ import asyncio
 import os
 import signal
 import threading
+import concurrent.futures
 
 # The MIT License (MIT)
 # Copyright © 2025 Sparket
@@ -64,6 +65,7 @@ from sparket.miner.config.config import Config as MinerAppConfig
 from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
 from sparket.miner.service import MinerService
 from sparket.shared.logging import suppress_bittensor_header_warnings
+from sparket.tools.mining_interview import ensure_interview_passed
 
 # Optional base miner import
 try:
@@ -190,11 +192,14 @@ class Miner(BaseMinerNeuron):
         bt_logger.propagate = False
 
         self._validator_cache: dict[str, dict[str, object]] = {}
+        self._validator_cache_max_entries: int = 128
         # Primary validator endpoint (set when CONNECTION_INFO_PUSH received)
         self.validator_endpoint: Optional[dict[str, object]] = None
         
         # Base miner for automatic odds generation
         self.base_miner: Optional["BaseMiner"] = None
+        self._base_runtime_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._base_runtime_thread: Optional[threading.Thread] = None
 
     async def forward(self, synapse: SparketSynapse) -> SparketSynapse:
         """Handle incoming Sparket synapses.
@@ -370,6 +375,11 @@ class Miner(BaseMinerNeuron):
             "token": token,
         }
         self._validator_cache[hotkey] = endpoint_data
+        if len(self._validator_cache) > self._validator_cache_max_entries:
+            # Drop the oldest cached validator to keep memory bounded.
+            oldest_hotkey = next(iter(self._validator_cache))
+            if oldest_hotkey != hotkey:
+                self._validator_cache.pop(oldest_hotkey, None)
         # Also set the primary validator_endpoint for MinerService/ValidatorClient to use
         self.validator_endpoint = endpoint_data
         bt.logging.info({
@@ -381,6 +391,12 @@ class Miner(BaseMinerNeuron):
                 "token_received": bool(token),
             }
         })
+        # Kick an immediate game sync when fresh validator endpoint arrives.
+        if self.game_sync is not None and self._base_runtime_loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(self.game_sync.sync_once(), self._base_runtime_loop)
+            except Exception as exc:
+                bt.logging.debug({"miner_sync_trigger_error": str(exc)})
 
     def initialize_base_miner(self) -> bool:
         """Initialize the base miner for automatic odds generation.
@@ -444,6 +460,69 @@ class Miner(BaseMinerNeuron):
         if self.base_miner is not None:
             await self.base_miner.stop()
 
+    def start_base_runtime(self) -> bool:
+        """Run game sync + base miner in a persistent async thread."""
+        if self._base_runtime_thread and self._base_runtime_thread.is_alive():
+            return True
+        if self.base_miner is None:
+            return False
+        loop = asyncio.new_event_loop()
+        self._base_runtime_loop = loop
+
+        async def _bootstrap() -> None:
+            if self.game_sync is not None:
+                await self.game_sync.start()
+                # Prime local market cache immediately for first odds cycle.
+                await self.game_sync.sync_once()
+            await self.base_miner.start()
+
+        def _runner() -> None:
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_bootstrap())
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
+        thread = threading.Thread(target=_runner, daemon=True, name="base-miner-runtime")
+        thread.start()
+        self._base_runtime_thread = thread
+        return True
+
+    def stop_base_runtime(self) -> None:
+        """Stop base miner runtime thread and async services."""
+        loop = self._base_runtime_loop
+        thread = self._base_runtime_thread
+        if loop is None or thread is None:
+            return
+
+        async def _shutdown() -> None:
+            if self.base_miner is not None:
+                await self.base_miner.stop()
+            if self.game_sync is not None:
+                await self.game_sync.stop()
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+            fut.result(timeout=10)
+        except (TimeoutError, concurrent.futures.TimeoutError, Exception):
+            pass
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        try:
+            thread.join(timeout=5)
+        except Exception:
+            pass
+        self._base_runtime_loop = None
+        self._base_runtime_thread = None
+
 
 # This is the main function, which runs the miner.
 async def _log_validator_endpoints(miner: Miner) -> None:
@@ -501,11 +580,34 @@ if __name__ == "__main__":
     
     # Initialize base miner (enabled by default; disable with SPARKET_BASE_MINER__ENABLED=false)
     # This provides automatic odds generation using ESPN data + optional The-Odds-API
-    base_miner_initialized = miner.initialize_base_miner()
+    base_miner_initialized = False
+    base_gate_ok = True
+    if BASE_MINER_AVAILABLE:
+        try:
+            candidate_cfg = BaseMinerConfig.from_env() if BaseMinerConfig is not None else None
+            if candidate_cfg is not None and candidate_cfg.enabled:
+                base_gate_ok, gate_reason = ensure_interview_passed()
+                if not base_gate_ok:
+                    bt.logging.error(
+                        {
+                            "base_miner_gate": "blocked",
+                            "reason": gate_reason,
+                            "interview": "Sparket mining interview",
+                        }
+                    )
+                    bt.logging.error(
+                        "Base miner disabled until interview pass. Run: python -m sparket.tools.mining_interview"
+                    )
+        except Exception as e:
+            base_gate_ok = False
+            bt.logging.error({"base_miner_gate": "error", "error": str(e)})
+
+    if base_gate_ok:
+        base_miner_initialized = miner.initialize_base_miner()
     if base_miner_initialized:
         try:
-            asyncio.run(_start_base_miner_async(miner))
-            bt.logging.info({"base_miner": "started"})
+            started = miner.start_base_runtime()
+            bt.logging.info({"base_miner": "started" if started else "not_started"})
         except Exception as e:
             bt.logging.warning({"base_miner": "start_failed", "error": str(e)})
     
@@ -537,12 +639,11 @@ if __name__ == "__main__":
         stop_event.set()
     finally:
         # Stop base miner
-        if miner.base_miner is not None:
-            try:
-                asyncio.run(_stop_base_miner_async(miner))
-                bt.logging.info({"base_miner": "stopped"})
-            except Exception:
-                pass
+        try:
+            miner.stop_base_runtime()
+            bt.logging.info({"base_miner": "stopped"})
+        except Exception:
+            pass
         
         if control_api:
             try:

@@ -20,8 +20,6 @@ def main() -> None:
     if os.environ.get("SPARKET_TEST_MODE") != "true":
         load_dotenv()
 
-    bt.logging.info({"auditor": "starting"})
-
     # Parse args using the v10 API (capitalised class names)
     import argparse
     parser = argparse.ArgumentParser(description="Sparket Auditor Validator")
@@ -36,6 +34,21 @@ def main() -> None:
     parser.add_argument("--auditor.data_dir", type=str, default="sparket/data/auditor")
 
     args = parser.parse_args()
+    # Default to TRACE unless an explicit logging flag is provided.
+    # This keeps maximum observability by default while preserving CLI overrides.
+    wants_trace = bool(getattr(args, "logging.trace", False))
+    wants_debug = bool(getattr(args, "logging.debug", False))
+    wants_info = bool(getattr(args, "logging.info", False))
+    explicit_level = wants_trace or wants_debug or wants_info
+
+    if not explicit_level:
+        bt.logging.setLevel("TRACE")
+        try:
+            bt.logging.enable_trace()
+        except Exception:
+            pass
+
+    bt.logging.info({"auditor": "starting"})
 
     # Override from env vars (env takes precedence over CLI)
     primary_hotkey = os.environ.get(
@@ -84,7 +97,13 @@ def main() -> None:
         getattr(args, "subtensor.network", None),
     )
     if chain_endpoint:
-        subtensor = bt.Subtensor(network=chain_endpoint)
+        # Configure custom endpoint explicitly in config (v10-safe).
+        subtensor_cfg = bt.Config()
+        subtensor_cfg.subtensor = bt.Config()
+        if network:
+            subtensor_cfg.subtensor.network = network
+        subtensor_cfg.subtensor.chain_endpoint = chain_endpoint
+        subtensor = bt.Subtensor(config=subtensor_cfg, fallback_endpoints=[chain_endpoint])
     elif network:
         subtensor = bt.Subtensor(network=network)
     else:

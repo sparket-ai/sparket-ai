@@ -39,7 +39,7 @@ async def test_outcome_processor_upserts_moneyline():
         call.kwargs.get("params") or call[1].get("params")
         for call in db.write.call_args_list
     ]
-    assert any(p.get("result") == "home" for p in params_list if isinstance(p, dict))
+    assert any(p.get("result") == "HOME" for p in params_list if isinstance(p, dict))
 
 
 def test_resolve_market_result_total():

@@ -123,8 +123,10 @@ class TestBaseMinerE2E:
         
         await miner._run_odds_cycle()
         
-        # Should have submitted for each market
-        assert mock_validator_client.submit_odds.call_count == 3
+        # Base miner batches markets into a single submission payload by default.
+        mock_validator_client.submit_odds.assert_called_once()
+        payload = mock_validator_client.submit_odds.await_args.args[0]
+        assert len(payload["submissions"]) == 3
     
     @pytest.mark.asyncio
     async def test_continuous_operation(self, miner_setup):
