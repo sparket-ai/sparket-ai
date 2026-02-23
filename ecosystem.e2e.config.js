@@ -115,6 +115,37 @@ module.exports = {
       kill_timeout: 5000,
     },
     
+    // SDIO data ingestor
+    {
+      name: 'e2e-ingestor',
+      script: path.join(projectRoot, 'sparket/entrypoints/ingestor.py'),
+      interpreter,
+      cwd: projectRoot,
+      instances: 1,
+      exec_mode: 'fork',
+      
+      env: {
+        ...baseEnv,
+        SPARKET_ROLE: 'ingestor',
+      },
+      
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '1G',
+      min_uptime: '10s',
+      max_restarts: 5,
+      restart_delay: 5000,
+      
+      error_file: path.join(logDir, 'e2e-ingestor-error.log'),
+      out_file: path.join(logDir, 'e2e-ingestor-out.log'),
+      log_file: path.join(logDir, 'e2e-ingestor-combined.log'),
+      time: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      merge_logs: true,
+      
+      kill_timeout: 5000,
+    },
+    
     // Miners
     ...miners.map(m => ({
       name: m.name,

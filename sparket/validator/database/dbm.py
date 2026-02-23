@@ -241,12 +241,14 @@ class DBM:
 
         async with self.session() as session:
             async with session.begin():
-                # Execute all in single transaction
-                total = 0
-                for params in params_list:
-                    result: Result = await session.execute(query, params)
-                    total += result.rowcount or 0
-                return total
+                # Use executemany in a single transaction for lower overhead.
+                result: Result = await session.execute(query, params_list)
+
+                # Some drivers may report -1 for rowcount on executemany.
+                # Fall back to attempted row count for deterministic behavior.
+                if result.rowcount is None or result.rowcount < 0:
+                    return len(params_list)
+                return int(result.rowcount)
 
     # Transaction tooling
     def transactional(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:

@@ -208,6 +208,60 @@ _COUNT_MARKET_SUBMISSIONS_BATCH = text(
     """
 )
 
+_INSERT_INBOX = text(
+    """
+    INSERT INTO inbox (
+        topic, payload, created_at, processed, retry_count, dedupe_key
+    ) VALUES (
+        :topic, :payload, :created_at, false, 0, :dedupe_key
+    )
+    """
+)
+
+_SELECT_PENDING_INBOX = text(
+    """
+    SELECT id, payload, created_at, retry_count
+    FROM inbox
+    WHERE topic = 'odds.submit'
+      AND processed = false
+      AND retry_count < :max_retries
+    ORDER BY created_at ASC
+    LIMIT :limit
+    """
+)
+
+_MARK_INBOX_PROCESSED = text(
+    """
+    UPDATE inbox
+    SET processed = true,
+        processed_at = :processed_at
+    WHERE id = :id
+    """
+)
+
+_MARK_INBOX_FAILED = text(
+    """
+    UPDATE inbox
+    SET retry_count = retry_count + 1,
+        last_error = :error,
+        processed = CASE
+            WHEN retry_count + 1 >= :max_retries THEN true
+            ELSE processed
+        END,
+        processed_at = CASE
+            WHEN retry_count + 1 >= :max_retries THEN :processed_at
+            ELSE processed_at
+        END
+    WHERE id = :id
+    """
+)
+
+
+def _odds_dedupe_key(miner_hotkey: str, received_at: datetime, bucket_seconds: int) -> str:
+    epoch = int(received_at.replace(tzinfo=timezone.utc).timestamp())
+    bucket = epoch - (epoch % bucket_seconds)
+    return f"odds:{miner_hotkey}:{bucket}"
+
 
 class IngestOddsHandler:
     """Handles miner odds submissions.
@@ -224,39 +278,67 @@ class IngestOddsHandler:
         self._ingest_params = get_scoring_params().ingest
 
     async def handle_synapse(self, synapse: SparketSynapse) -> MinerOddsPushed | None:
-        """Process ODDS_PUSH synapse from miner."""
+        """Queue ODDS_PUSH for asynchronous processing and return immediately."""
         if synapse.type != SparketSynapseType.ODDS_PUSH:
             return None
-        
+
         miner_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None) or ""
         raw = synapse.payload if isinstance(synapse.payload, dict) else {}
         received_at = datetime.now(timezone.utc)
-        
+
+        envelope = {
+            "topic": "odds.submit",
+            "payload": json.dumps({
+                "miner_hotkey": miner_hotkey,
+                "received_at": received_at.isoformat(),
+                "raw": raw,
+            }),
+            "created_at": received_at,
+            "dedupe_key": _odds_dedupe_key(
+                miner_hotkey,
+                received_at,
+                self._ingest_params.odds_bucket_seconds,
+            ),
+        }
+        accepted = False
+        try:
+            await self.database.write(_INSERT_INBOX, params=envelope)
+            accepted = True
+        except Exception as e:
+            bt.logging.warning({"ingest_odds_enqueue_error": str(e)})
+
+        return MinerOddsPushed(
+            miner_hotkey=miner_hotkey,
+            payload={
+                "accepted": accepted,
+                "queued": accepted,
+            },
+        )
+
+    async def process_enqueued_payload(
+        self,
+        *,
+        miner_hotkey: str,
+        raw: dict,
+        received_at: datetime,
+    ) -> Dict[str, int]:
+        """Process queued odds payload outside request/response flow."""
         # SECURITY: Derive miner_id from authenticated hotkey, NEVER trust payload
         miner_id = await self._get_miner_id_from_hotkey(miner_hotkey)
         if miner_id is None:
             bt.logging.warning({"ingest_odds_rejected": "miner_not_registered", "hotkey": miner_hotkey[:16] + "..."})
-            return MinerOddsPushed(miner_hotkey=miner_hotkey, payload={"rows": [], "rejected": 0, "error": "miner_not_registered"})
-        
+            return {"rows": 0, "persisted": 0, "rejected": 0}
+
         # Extract market IDs from submission
         requested_market_ids = self._extract_market_ids(raw)
         if not requested_market_ids:
             bt.logging.debug({"ingest_odds": "no_markets_in_submission"})
-            return MinerOddsPushed(miner_hotkey=miner_hotkey, payload={"rows": [], "rejected": 0})
-        
+            return {"rows": 0, "persisted": 0, "rejected": 0}
+
         # Validate which markets are within submission window
         valid_market_ids = await self._get_valid_market_ids(requested_market_ids, received_at)
         rejected_count = len(requested_market_ids) - len(valid_market_ids)
-        
-        if rejected_count > 0:
-            bt.logging.info({
-                "ingest_odds_validation": {
-                    "requested": len(requested_market_ids),
-                    "valid": len(valid_market_ids),
-                    "rejected": rejected_count,
-                }
-            })
-        
+
         # Parse and filter submissions (miner_id derived from hotkey, not payload)
         rows = await self._coerce_with_caps(
             payload=raw,
@@ -265,27 +347,16 @@ class IngestOddsHandler:
             received_at=received_at,
             valid_market_ids=valid_market_ids,
         )
-        
-        # Persist valid rows in a single transaction (batch insert)
+
+        # Persist valid rows in a single transaction
         persisted = 0
         if rows:
             try:
                 persisted = await self.database.write_many(_INSERT_MINER_SUBMISSION, rows)
             except Exception as e:
                 bt.logging.warning({"ingest_odds_persist_error": str(e)})
-        
-        event = MinerOddsPushed(
-            miner_hotkey=miner_hotkey, 
-            payload={"rows": rows, "persisted": persisted, "rejected": rejected_count}
-        )
-        bt.logging.info({
-            "ingest_odds": {
-                "miner": miner_hotkey[:16] + "...",
-                "rows": len(rows),
-                "persisted": persisted,
-            }
-        })
-        return event
+
+        return {"rows": len(rows), "persisted": persisted, "rejected": rejected_count}
 
     async def _coerce_with_caps(
         self,
@@ -450,3 +521,78 @@ class IngestOddsHandler:
         )
         
         return {int(r["market_id"]) for r in rows}
+
+
+async def run_odds_processing_if_due(
+    *,
+    validator: Any,
+    database: Any,
+    limit: int = 200,
+) -> int:
+    timers = getattr(getattr(getattr(validator, "app_config", None), "core", None), "timers", None)
+    steps_interval = 1
+    if timers is not None:
+        try:
+            steps_interval = int(getattr(timers, "odds_process_steps", 1))
+        except Exception:
+            pass
+    if steps_interval <= 0 or (validator.step % steps_interval != 0):
+        return 0
+
+    max_retries = int(get_scoring_params().ingest.outcome_max_retries)
+    rows = await database.read(
+        _SELECT_PENDING_INBOX,
+        params={"limit": limit, "max_retries": max_retries},
+        mappings=True,
+    )
+    if not rows:
+        return 0
+
+    handler = IngestOddsHandler(database)
+    processed = 0
+    for row in rows:
+        inbox_id = row["id"]
+        payload = row.get("payload")
+        created_at = row.get("created_at") or datetime.now(timezone.utc)
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("odds_payload_not_dict")
+
+            miner_hotkey = str(payload.get("miner_hotkey") or "")
+            raw = payload.get("raw")
+            if not isinstance(raw, dict):
+                raise ValueError("odds_raw_not_dict")
+
+            received_at_raw = payload.get("received_at")
+            if isinstance(received_at_raw, str):
+                received_at = datetime.fromisoformat(received_at_raw.replace("Z", "+00:00"))
+                if received_at.tzinfo is None:
+                    received_at = received_at.replace(tzinfo=timezone.utc)
+            else:
+                received_at = created_at if isinstance(created_at, datetime) else datetime.now(timezone.utc)
+
+            await handler.process_enqueued_payload(
+                miner_hotkey=miner_hotkey,
+                raw=raw,
+                received_at=received_at,
+            )
+            await database.write(
+                _MARK_INBOX_PROCESSED,
+                params={"id": inbox_id, "processed_at": datetime.now(timezone.utc)},
+            )
+            processed += 1
+        except Exception as exc:
+            await database.write(
+                _MARK_INBOX_FAILED,
+                params={
+                    "id": inbox_id,
+                    "error": str(exc)[:1000],
+                    "processed_at": datetime.now(timezone.utc),
+                    "max_retries": max_retries,
+                },
+            )
+
+    if processed:
+        bt.logging.info({"odds_inbox_processed": processed})
+
+    return processed

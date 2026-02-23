@@ -81,7 +81,7 @@ class StubDatabase:
         return []
 
     async def write(self, *_, **__):
-        return []
+        return 0
 
 
 def base_league_config() -> LeagueConfig:
@@ -302,7 +302,8 @@ async def _schedule_tracks_only_window(monkeypatch):
     )
 
     inserted = await ingestor._refresh_schedule(state, now)
-    assert inserted == 2
+    # far game (20 days out) is beyond track_days_ahead=7, so only near game is upserted
+    assert inserted == 1
     assert (LeagueCode.NFL, 50) in ingestor.tracked_events
     assert (LeagueCode.NFL, 51) not in ingestor.tracked_events
 
@@ -515,8 +516,18 @@ async def _persist_odds_inserts_quotes(monkeypatch):
         start_time=now + timedelta(hours=1),
     )
 
-    async def fake_ensure_market(database, market_row, *, event_id):
-        return 500 + event_id
+    _next_mid = 500
+
+    async def fake_ensure_markets_batch(database, market_rows, *, event_id):
+        nonlocal _next_mid
+        from sparket.validator.database.resolver import _market_key
+        result = {}
+        for mrow in market_rows:
+            key = _market_key(mrow)
+            if key not in result:
+                result[key] = _next_mid
+                _next_mid += 1
+        return result
 
     captured_quotes = []
 
@@ -526,8 +537,8 @@ async def _persist_odds_inserts_quotes(monkeypatch):
         return len(batch)
 
     monkeypatch.setattr(
-        "sparket.validator.services.sportsdata_ingestor.ensure_market",
-        fake_ensure_market,
+        "sparket.validator.services.sportsdata_ingestor.ensure_markets_batch",
+        fake_ensure_markets_batch,
     )
     monkeypatch.setattr(
         "sparket.validator.services.sportsdata_ingestor.insert_provider_quotes",
@@ -593,15 +604,25 @@ async def _history_filters_duplicates(monkeypatch):
         start_time=now + timedelta(hours=4),
     )
 
-    async def fake_ensure_market(database, market_row, *, event_id):
-        return 500 + event_id
+    _next_mid = 500
+
+    async def fake_ensure_markets_batch(database, market_rows, *, event_id):
+        nonlocal _next_mid
+        from sparket.validator.database.resolver import _market_key
+        result = {}
+        for mrow in market_rows:
+            key = _market_key(mrow)
+            if key not in result:
+                result[key] = _next_mid
+                _next_mid += 1
+        return result
 
     async def fake_insert_provider_quotes(*, database, quotes):
         return len(list(quotes))
 
     monkeypatch.setattr(
-        "sparket.validator.services.sportsdata_ingestor.ensure_market",
-        fake_ensure_market,
+        "sparket.validator.services.sportsdata_ingestor.ensure_markets_batch",
+        fake_ensure_markets_batch,
     )
     monkeypatch.setattr(
         "sparket.validator.services.sportsdata_ingestor.insert_provider_quotes",
@@ -930,4 +951,426 @@ async def _upsert_event_resolves_soccer_keys_and_patches(monkeypatch):
     assert capture_db.calls[0]["event_id"] == 7001
     assert capture_db.calls[0]["home_team_id"] == 101
     assert capture_db.calls[0]["away_team_id"] == 102
+
+
+# ===========================================================================
+# Improvement 1: Parallel odds fetching
+# ===========================================================================
+
+def test_parallel_odds_respects_concurrency():
+    asyncio.run(_test_parallel_odds_respects_concurrency())
+
+
+async def _test_parallel_odds_respects_concurrency():
+    """With concurrency=2, max 2 snapshots should run simultaneously."""
+    now = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+    peak_concurrent = 0
+    current_concurrent = 0
+
+    league_cfg = base_league_config()
+    config = SportsDataIOConfig(leagues=[league_cfg])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], None), config=config)
+    ingestor.MAX_CONCURRENT_SNAPSHOTS = 2
+
+    state = SimpleNamespace(config=league_cfg)
+
+    for i in range(6):
+        key = (LeagueCode.NFL, 100 + i)
+        ingestor.tracked_events[key] = TrackedEvent(
+            league_code=LeagueCode.NFL,
+            game_id=100 + i,
+            event_id=100 + i,
+            start_time=now + timedelta(days=1),
+        )
+
+    original_capture = SportsDataIngestor._capture_snapshot
+
+    async def counting_capture(self, st, tracked, n, *, metrics=None):
+        nonlocal peak_concurrent, current_concurrent
+        current_concurrent += 1
+        if current_concurrent > peak_concurrent:
+            peak_concurrent = current_concurrent
+        await asyncio.sleep(0.01)
+        current_concurrent -= 1
+
+    ingestor._capture_snapshot = counting_capture.__get__(ingestor, SportsDataIngestor)
+    await ingestor._refresh_odds(state, now)
+
+    assert peak_concurrent <= 2
+
+
+def test_parallel_odds_single_failure():
+    asyncio.run(_test_parallel_odds_single_failure())
+
+
+async def _test_parallel_odds_single_failure():
+    """One failing snapshot shouldn't prevent others from completing."""
+    now = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+    completed = []
+
+    league_cfg = base_league_config()
+    config = SportsDataIOConfig(leagues=[league_cfg])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], None), config=config)
+    state = SimpleNamespace(config=league_cfg)
+
+    for i in range(4):
+        key = (LeagueCode.NFL, 200 + i)
+        ingestor.tracked_events[key] = TrackedEvent(
+            league_code=LeagueCode.NFL,
+            game_id=200 + i,
+            event_id=200 + i,
+            start_time=now + timedelta(days=1),
+        )
+
+    async def maybe_fail(self, st, tracked, n, *, metrics=None):
+        if tracked.game_id == 201:
+            raise RuntimeError("boom")
+        completed.append(tracked.game_id)
+
+    ingestor._capture_snapshot = maybe_fail.__get__(ingestor, SportsDataIngestor)
+    await ingestor._refresh_odds(state, now)
+
+    assert len(completed) == 3
+    assert 201 not in completed
+
+
+def test_parallel_odds_empty_league():
+    asyncio.run(_test_parallel_odds_empty())
+
+
+async def _test_parallel_odds_empty():
+    """Zero tracked events should be a no-op."""
+    now = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+    league_cfg = base_league_config()
+    config = SportsDataIOConfig(leagues=[league_cfg])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], None), config=config)
+    state = SimpleNamespace(config=league_cfg)
+
+    metrics = {"events_tracked": 0, "snapshot_attempts": 0, "snapshot_success": 0, "snapshot_missed": 0}
+    await ingestor._refresh_odds(state, now, metrics=metrics)
+    assert metrics["snapshot_attempts"] == 0
+
+
+# ===========================================================================
+# Improvement 2: Batched market resolution
+# ===========================================================================
+
+def test_ensure_markets_batch_creates_missing():
+    asyncio.run(_test_ensure_markets_batch_creates())
+
+
+async def _test_ensure_markets_batch_creates():
+    from sparket.validator.database.resolver import ensure_markets_batch, MarketKey
+
+    next_id = 1
+
+    class MarketDB:
+        async def read(self, query, params=None, mappings=False):
+            return []
+
+        async def write(self, query, params=None, return_rows=False, mappings=False):
+            nonlocal next_id
+            mid = next_id
+            next_id += 1
+            return 0
+
+    class ReadAfterWrite:
+        """Returns empty on first read per kind, then returns after write."""
+        def __init__(self):
+            self._written = {}
+            self._next_id = 1
+
+        async def read(self, query, params=None, mappings=False):
+            sql = str(query)
+            if "event_id" in (params or {}) and "kind" in (params or {}):
+                key = (params["kind"], params.get("line"), params.get("points_team_id"))
+                if key in self._written:
+                    return [{"market_id": self._written[key]}]
+            if params and "event_id" in params and "kind" not in params:
+                return [{"market_id": v, "kind": k[0], "line": None, "line_cmp": 0, "pts_cmp": 0, "points_team_id": None}
+                        for k, v in self._written.items()]
+            return []
+
+        async def write(self, query, params=None, return_rows=False, mappings=False):
+            if params and "kind" in params:
+                key = (params["kind"], params.get("line"), params.get("points_team_id"))
+                mid = self._next_id
+                self._next_id += 1
+                self._written[key] = mid
+            return 0
+
+    db = ReadAfterWrite()
+    rows = [
+        {"kind": "MONEYLINE", "line": None, "points_team_id": None},
+        {"kind": "SPREAD", "line": -3.5, "points_team_id": None},
+        {"kind": "TOTAL", "line": 45.5, "points_team_id": None},
+    ]
+    result = await ensure_markets_batch(db, rows, event_id=1)
+    assert len(result) == 3
+
+
+def test_ensure_markets_batch_empty():
+    asyncio.run(_test_batch_empty())
+
+
+async def _test_batch_empty():
+    from sparket.validator.database.resolver import ensure_markets_batch
+    result = await ensure_markets_batch(StubDatabase(), [], event_id=1)
+    assert result == {}
+
+
+# ===========================================================================
+# Improvement 3: In-memory caches
+# ===========================================================================
+
+def test_sportsbook_cache_avoids_repeated_queries():
+    asyncio.run(_test_sportsbook_cache())
+
+
+async def _test_sportsbook_cache():
+    """After first load, _ensure_sportsbooks should not re-query DB for known codes."""
+    db_reads = 0
+
+    class CountingDB:
+        async def read(self, *_, **__):
+            nonlocal db_reads
+            db_reads += 1
+            return [{"code": "FanDuel"}, {"code": "DraftKings"}]
+
+        async def write(self, *_, **__):
+            return 0
+
+    league_cfg = base_league_config()
+    config = SportsDataIOConfig(leagues=[league_cfg])
+    ingestor = SportsDataIngestor(database=CountingDB(), client=FakeClient([], None), config=config)
+
+    odds1 = SimpleNamespace(sportsbook="FanDuel")
+    odds2 = SimpleNamespace(sportsbook="DraftKings")
+
+    await ingestor._ensure_sportsbooks([odds1, odds2])
+    first_reads = db_reads
+    await ingestor._ensure_sportsbooks([odds1, odds2])
+
+    assert db_reads == first_reads, "Second call should not query DB"
+
+
+def test_sportsbook_cache_detects_new_codes():
+    asyncio.run(_test_sportsbook_new())
+
+
+async def _test_sportsbook_new():
+    writes = []
+
+    class TrackDB:
+        async def read(self, *_, **__):
+            return [{"code": "FanDuel"}]
+
+        async def write(self, query, params=None, return_rows=False, mappings=False):
+            writes.append(params)
+            if return_rows:
+                return [(999,)]
+            return 0
+
+    league_cfg = base_league_config()
+    config = SportsDataIOConfig(leagues=[league_cfg])
+    ingestor = SportsDataIngestor(database=TrackDB(), client=FakeClient([], None), config=config)
+
+    await ingestor._ensure_sportsbooks([SimpleNamespace(sportsbook="FanDuel")])
+    assert len(writes) == 0
+
+    await ingestor._ensure_sportsbooks([SimpleNamespace(sportsbook="BetMGM")])
+    assert any(p.get("code") == "BetMGM" for p in writes if p)
+    assert "BetMGM" in ingestor._known_sportsbook_codes
+
+
+def test_market_cache_cleared_on_finalize():
+    league_cfg = base_league_config()
+    config = SportsDataIOConfig(leagues=[league_cfg])
+    ingestor = SportsDataIngestor(database=StubDatabase(), client=FakeClient([], None), config=config)
+    state = SimpleNamespace(config=league_cfg)
+
+    tracked = TrackedEvent(
+        league_code=LeagueCode.NFL, game_id=42, event_id=42,
+        start_time=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    key = (LeagueCode.NFL, 42)
+    ingestor.tracked_events[key] = tracked
+
+    from sparket.validator.database.resolver import MarketKey
+    from decimal import Decimal
+    ingestor._market_id_cache[(42, ("MONEYLINE", None, None))] = 100
+    ingestor._market_id_cache[(42, ("SPREAD", Decimal("-3.5"), None))] = 101
+    ingestor._market_id_cache[(99, ("MONEYLINE", None, None))] = 200
+
+    ingestor._finalize_tracked_event(state, tracked, reason="test")
+
+    assert (42, ("MONEYLINE", None, None)) not in ingestor._market_id_cache
+    assert (42, ("SPREAD", Decimal("-3.5"), None)) not in ingestor._market_id_cache
+    assert (99, ("MONEYLINE", None, None)) in ingestor._market_id_cache
+
+
+# ===========================================================================
+# Improvement 4: Smart season resolution
+# ===========================================================================
+
+def _nba_config() -> LeagueConfig:
+    return LeagueConfig(
+        code=LeagueCode.NBA,
+        league_code="nba",
+        sport_code="basketball",
+        schedule_url="https://example.com/games/{SEASON}",
+        odds_url="https://example.com/odds/{GAMEID}",
+        schedule_mode="season",
+        season_format="{year}",
+        season_year_offset=1,
+        off_season_months=[7, 8, 9],
+        transition_months=[6, 10],
+    )
+
+
+def _nfl_config() -> LeagueConfig:
+    return LeagueConfig(
+        code=LeagueCode.NFL,
+        league_code="nfl",
+        sport_code="football",
+        schedule_url="https://example.com/schedule/{SEASON}",
+        odds_url="https://example.com/odds/{GAMEID}",
+        schedule_mode="season",
+        season_format="{year}{season_type}",
+        season_types=["PRE", "REG", "POST"],
+        season_year_offset=-1,
+        off_season_months=[4, 5, 6, 7],
+        transition_months=[2, 3, 8, 9],
+    )
+
+
+def _mlb_config() -> LeagueConfig:
+    return LeagueConfig(
+        code=LeagueCode.MLB,
+        league_code="mlb",
+        sport_code="baseball",
+        schedule_url="https://example.com/games/{SEASON}",
+        odds_url="https://example.com/odds/{GAMEID}",
+        schedule_mode="season",
+        season_format="{year}",
+        off_season_months=[11, 12, 1, 2],
+        transition_months=[3, 10],
+    )
+
+
+def test_nba_season_year_october():
+    """Oct 2026: NBA new season starts → primary year = 2027."""
+    now = datetime(2026, 10, 15, tzinfo=timezone.utc)
+    cfg = _nba_config()
+    seasons = SportsDataIngestor._compute_active_seasons(now, cfg)
+    codes = [s[0] for s in seasons]
+    assert "2027" in codes
+    # Oct is a transition month, so both 2027 and 2028 should appear
+    assert len(codes) == 2
+
+
+def test_nba_season_year_june():
+    """Jun 2026: NBA season ending → primary 2026 + transition."""
+    now = datetime(2026, 6, 15, tzinfo=timezone.utc)
+    cfg = _nba_config()
+    seasons = SportsDataIngestor._compute_active_seasons(now, cfg)
+    codes = [s[0] for s in seasons]
+    assert "2026" in codes
+    assert len(codes) == 2  # June is transition
+
+
+def test_nba_season_year_march():
+    """Mar 2026: mid-season, no transition → just 2026."""
+    now = datetime(2026, 3, 15, tzinfo=timezone.utc)
+    cfg = _nba_config()
+    seasons = SportsDataIngestor._compute_active_seasons(now, cfg)
+    codes = [s[0] for s in seasons]
+    assert codes == ["2026"]
+
+
+def test_nfl_includes_preseason():
+    """NFL season_types should include PRE, REG, POST."""
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    cfg = _nfl_config()
+    seasons = SportsDataIngestor._compute_active_seasons(now, cfg)
+    season_types = [s[1] for s in seasons]
+    assert "PRE" in season_types
+    assert "REG" in season_types
+    assert "POST" in season_types
+
+
+def test_nfl_transition_fetches_adjacent():
+    """Sept is a transition month for NFL → should fetch both years."""
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    cfg = _nfl_config()
+    seasons = SportsDataIngestor._compute_active_seasons(now, cfg)
+    years = {s[0][:4] for s in seasons}
+    assert len(years) == 2
+
+
+def test_mlb_calendar_year():
+    """MLB: June 2026, no offset → just 2026, no transitions."""
+    now = datetime(2026, 6, 15, tzinfo=timezone.utc)
+    cfg = _mlb_config()
+    seasons = SportsDataIngestor._compute_active_seasons(now, cfg)
+    assert len(seasons) == 1
+    assert seasons[0][0] == "2026"
+
+
+def test_off_season_skip():
+    asyncio.run(_test_off_season_skip())
+
+
+async def _test_off_season_skip():
+    """During off-season with no upcoming games, schedule refresh should be skipped."""
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+
+    class EmptyDB:
+        async def read(self, *_, **__):
+            return []
+        async def write(self, *_, **__):
+            return 0
+
+    nfl_cfg = _nfl_config()
+    config = SportsDataIOConfig(leagues=[nfl_cfg])
+    client = FakeClient([], None)
+    ingestor = SportsDataIngestor(database=EmptyDB(), client=client, config=config)
+
+    state = ingestor.leagues[LeagueCode.NFL]
+    state.league_id = 1
+    state.team_index = {}
+
+    result = await ingestor._refresh_schedule(state, now)
+    assert result == 0
+    assert client.schedule_requests == 0
+
+
+def test_off_season_with_upcoming_games():
+    asyncio.run(_test_off_season_with_games())
+
+
+async def _test_off_season_with_games():
+    """During off-season but DB has upcoming games → should still fetch."""
+    now = datetime(2026, 5, 15, tzinfo=timezone.utc)
+
+    class HasGamesDB:
+        async def read(self, query, params=None, mappings=False):
+            sql_text = str(getattr(query, "text", query))
+            if "status = 'scheduled'" in sql_text:
+                return [(1,)]
+            return []
+        async def write(self, *_, **__):
+            return 0
+
+    nfl_cfg = _nfl_config()
+    config = SportsDataIOConfig(leagues=[nfl_cfg])
+    client = FakeClient([], None)
+    ingestor = SportsDataIngestor(database=HasGamesDB(), client=client, config=config)
+
+    state = ingestor.leagues[LeagueCode.NFL]
+    state.league_id = 1
+    state.team_index = {}
+
+    result = await ingestor._refresh_schedule(state, now)
+    assert client.schedule_requests > 0
 

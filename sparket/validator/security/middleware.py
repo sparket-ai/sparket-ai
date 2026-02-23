@@ -128,8 +128,20 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 headers=headers if headers else None,
             )
         
-        # Request passed security checks, continue to next middleware
-        return await call_next(request)
+        # Request passed security checks, continue to next middleware.
+        # With BaseHTTPMiddleware, client disconnects can raise
+        # RuntimeError("No response returned."); treat that as a benign
+        # disconnect instead of surfacing a 500.
+        try:
+            return await call_next(request)
+        except RuntimeError as exc:
+            if "No response returned." in str(exc):
+                try:
+                    if await request.is_disconnected():
+                        return Response(status_code=204)
+                except Exception:
+                    pass
+            raise
     
     def _get_client_ip(self, request: Request) -> Optional[str]:
         """Extract client IP, handling reverse proxies."""

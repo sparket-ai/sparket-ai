@@ -41,8 +41,10 @@ class LeagueConfig(BaseModel):
     schedule_mode: str = Field(default="date")
     season_format: Optional[str] = None
     season_type: Optional[str] = None
-    season_types: Optional[List[str]] = None  # Multiple season types (e.g., ["REG", "POST"] for NFL)
+    season_types: Optional[List[str]] = None
     season_year_offset: int = 0
+    off_season_months: Optional[List[int]] = None
+    transition_months: Optional[List[int]] = None
 
     @model_validator(mode="after")
     def _validate_intervals(self) -> "LeagueConfig":
@@ -134,8 +136,10 @@ def build_default_config() -> SportsDataIOConfig:
             teams_url=f"{base}/nfl/scores/json/Teams",
             schedule_mode="season",
             season_format="{year}{season_type}",
-            season_types=["REG", "POST"],  # Regular season + playoffs
-            season_year_offset=-1,  # NFL uses starting year: Jan-Feb → prev year, else current
+            season_types=["PRE", "REG", "POST"],
+            season_year_offset=-1,
+            off_season_months=[4, 5, 6, 7],
+            transition_months=[2, 3, 8, 9],
         ),
         LeagueConfig(
             code=LeagueCode.NBA,
@@ -151,7 +155,9 @@ def build_default_config() -> SportsDataIOConfig:
             track_days_ahead=3,
             schedule_mode="season",
             season_format="{year}",
-            season_year_offset=1,  # NBA season Oct-June uses ending year
+            season_year_offset=1,
+            off_season_months=[7, 8, 9],
+            transition_months=[6, 10],
         ),
         LeagueConfig(
             code=LeagueCode.MLB,
@@ -167,6 +173,8 @@ def build_default_config() -> SportsDataIOConfig:
             track_days_ahead=3,
             schedule_mode="season",
             season_format="{year}",
+            off_season_months=[11, 12, 1, 2],
+            transition_months=[3, 10],
         ),
         LeagueConfig(
             code=LeagueCode.NHL,
@@ -182,7 +190,9 @@ def build_default_config() -> SportsDataIOConfig:
             track_days_ahead=4,
             schedule_mode="season",
             season_format="{year}",
-            season_year_offset=1,  # NHL season Oct-June uses ending year
+            season_year_offset=1,
+            off_season_months=[7, 8, 9],
+            transition_months=[6, 10],
         ),
     ]
     

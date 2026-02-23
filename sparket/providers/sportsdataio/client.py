@@ -188,12 +188,34 @@ class SportsDataIOClient:
                     bt.logging.debug({"sdio_http_404": {"url": url}})
                     return []
                 if status in (401, 403):
+                    bt.logging.error({
+                        "sdio_auth_error": {
+                            "status": status,
+                            "url": url.split("?")[0],
+                            "body": exc.response.text[:200],
+                        }
+                    })
                     raise
                 if attempt >= self.max_retries:
+                    bt.logging.warning({
+                        "sdio_http_exhausted": {
+                            "status": status,
+                            "url": url.split("?")[0],
+                            "attempts": attempt + 1,
+                        }
+                    })
                     raise
                 await asyncio.sleep(backoff)
-            except (httpx.RequestError, httpx.TimeoutException):
+            except (httpx.RequestError, httpx.TimeoutException) as exc:
                 if attempt >= self.max_retries:
+                    bt.logging.warning({
+                        "sdio_request_exhausted": {
+                            "error": str(exc),
+                            "type": type(exc).__name__,
+                            "url": url.split("?")[0],
+                            "attempts": attempt + 1,
+                        }
+                    })
                     raise
                 await asyncio.sleep(backoff)
             attempt += 1

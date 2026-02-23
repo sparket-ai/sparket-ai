@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import bittensor as bt
 
@@ -39,6 +41,71 @@ class ValidatorClient:
         self._backoff_until: float = 0.0
         self._current_backoff: float = self.INITIAL_BACKOFF_SEC
 
+    def _resolve_endpoint_host_port(self) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        """Resolve preferred validator endpoint announced via CONNECTION_INFO_PUSH."""
+        if self._get_endpoint is None:
+            return None, None, None
+        try:
+            endpoint = self._get_endpoint() or {}
+        except Exception:
+            return None, None, None
+        if not isinstance(endpoint, dict):
+            return None, None, None
+
+        hotkey = endpoint.get("hotkey")
+        host = endpoint.get("host")
+        port = endpoint.get("port")
+        url = endpoint.get("url")
+
+        if isinstance(url, str) and url:
+            try:
+                parsed = urlparse(url)
+                if parsed.hostname:
+                    host = parsed.hostname
+                if parsed.port:
+                    port = parsed.port
+            except Exception:
+                pass
+
+        if isinstance(port, str):
+            try:
+                port = int(port)
+            except ValueError:
+                port = None
+        if isinstance(port, int) and port <= 0:
+            port = None
+
+        return (str(host) if host else None), port, (str(hotkey) if hotkey else None)
+
+    def _build_preferred_axon(self, axons: List[Any]) -> Optional[Any]:
+        """Build an axon override using validator-pushed endpoint data."""
+        host, port, hotkey = self._resolve_endpoint_host_port()
+        if not host or not port or not axons:
+            return None
+
+        base_axon = None
+        if hotkey:
+            try:
+                hotkeys = list(getattr(self._metagraph, "hotkeys", []))
+                idx = hotkeys.index(hotkey)
+                metagraph_axons = list(getattr(self._metagraph, "axons", []))
+                if 0 <= idx < len(metagraph_axons):
+                    base_axon = metagraph_axons[idx]
+            except Exception:
+                base_axon = None
+
+        if base_axon is None:
+            # Fallback to any selected validator axon so we retain required fields.
+            base_axon = axons[0]
+
+        try:
+            preferred = copy.deepcopy(base_axon)
+            preferred.ip = host
+            preferred.port = int(port)
+            return preferred
+        except Exception:
+            return None
+
     def _select_validator_axons(self) -> List[Any]:
         """Select validator axons to communicate with.
         
@@ -55,6 +122,24 @@ class ValidatorClient:
             # Fallback: any axon with active port
             if not selected:
                 selected = [ax for ax in axons if getattr(ax, "port", 0) > 0]
+            preferred = self._build_preferred_axon(selected)
+            if preferred is not None:
+                preferred_hotkey = getattr(preferred, "hotkey", None)
+                preferred_ip = getattr(preferred, "ip", None)
+                preferred_port = getattr(preferred, "port", None)
+                deduped = []
+                for ax in selected:
+                    same_hotkey = preferred_hotkey and getattr(ax, "hotkey", None) == preferred_hotkey
+                    same_endpoint = (
+                        preferred_ip
+                        and preferred_port
+                        and getattr(ax, "ip", None) == preferred_ip
+                        and getattr(ax, "port", None) == preferred_port
+                    )
+                    if same_hotkey or same_endpoint:
+                        continue
+                    deduped.append(ax)
+                selected = [preferred, *deduped]
             return selected
         except Exception:
             return []
@@ -92,9 +177,10 @@ class ValidatorClient:
             - should_backoff: True if validator returned "not_ready" or cooldown
         """
         if not responses:
-            return True, False  # No response to check
+            return False, False  # No response to check
         
         should_backoff = False
+        accepted_any = False
         
         for i, resp in enumerate(responses if isinstance(responses, list) else [responses]):
             # Check dendrite status code FIRST (security middleware rejections)
@@ -112,7 +198,8 @@ class ValidatorClient:
                         "will_backoff": True,
                     }
                 })
-                return False, True  # Failed, should backoff
+                should_backoff = True
+                continue
             elif status_code == 403:
                 # Forbidden (blacklisted or not registered)
                 bt.logging.warning({
@@ -121,7 +208,7 @@ class ValidatorClient:
                         "message": status_msg,
                     }
                 })
-                return False, False  # Failed, no backoff (won't help)
+                continue
             elif status_code is not None and status_code >= 400:
                 # Other HTTP error
                 bt.logging.warning({
@@ -130,7 +217,7 @@ class ValidatorClient:
                         "message": status_msg,
                     }
                 })
-                return False, False
+                continue
             
             # Extract payload from response
             if isinstance(resp, dict):
@@ -162,7 +249,7 @@ class ValidatorClient:
                             "validator_index": i,
                         }
                     })
-                return False, should_backoff
+                continue
             
             # Log if submission was not accepted (but no error)
             if result.get("accepted") is False:
@@ -172,8 +259,11 @@ class ValidatorClient:
                         "validator_index": i,
                     }
                 })
+                continue
+
+            accepted_any = True
         
-        return True, False
+        return accepted_any, should_backoff
 
     async def submit_odds(self, payload: dict, *, timeout: float = 12.0) -> bool:
         """Submit odds to validators.

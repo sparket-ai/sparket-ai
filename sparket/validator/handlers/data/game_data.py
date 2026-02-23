@@ -11,26 +11,13 @@ conflicts when called from Bittensor's axon request context.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import bittensor as bt
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from sparket.protocol.protocol import SparketSynapse, SparketSynapseType
-
-
-def _build_db_url() -> str:
-    """Build database URL from environment/config."""
-    user = os.getenv("SPARKET_DATABASE__USER", "sparket")
-    password = os.getenv("SPARKET_DATABASE__PASSWORD", "sparket")
-    host = os.getenv("SPARKET_DATABASE__HOST", "127.0.0.1")
-    port = os.getenv("SPARKET_DATABASE__PORT", "5435")
-    name = os.getenv("SPARKET_DATABASE__NAME", "sparket")
-    return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{name}"
-
 
 # Query for upcoming games with team names and league/sport info
 _SELECT_UPCOMING_GAMES = text(
@@ -95,9 +82,8 @@ class GameDataHandler:
     MAX_EVENTS_PER_REQUEST = 500
     
     def __init__(self, database: Any, *, use_mock: bool = False):
-        # Keep reference but we'll create fresh connections per request (unless mocked)
+        # Keep reference to shared DB manager for lightweight request handling.
         self._database = database
-        self._db_url = _build_db_url()
         # In test mode, use the passed-in database directly
         self._use_mock = use_mock or hasattr(database, 'games')
     
@@ -125,75 +111,66 @@ class GameDataHandler:
                 markets = [m for m in getattr(self._database, 'markets', []) if m["event_id"] in event_ids]
                 return self._build_response(games, markets, now)
             
-            # Create a fresh engine for this request to avoid event loop issues
-            engine = create_async_engine(self._db_url, pool_size=1, max_overflow=0)
+            # Fetch upcoming games within window
+            games = await self._fetch_upcoming_games(now)
             
-            try:
-                # Fetch upcoming games within window
-                games = await self._fetch_upcoming_games(engine, now)
-                
-                if not games:
-                    return self._build_response([], [], now)
-                
-                # Fetch markets for these games
-                event_ids = [g["event_id"] for g in games]
-                markets = await self._fetch_markets(engine, event_ids)
-                
-                response = self._build_response(games, markets, now)
-                
-                bt.logging.info({
-                    "game_data_request": {
-                        "games_count": len(games),
-                        "markets_count": len(markets),
-                        "response_keys": list(response.keys()) if response else [],
+            if not games:
+                return self._build_response([], [], now)
+            
+            # Fetch markets for these games
+            event_ids = [g["event_id"] for g in games]
+            markets = await self._fetch_markets(event_ids)
+            
+            response = self._build_response(games, markets, now)
+            
+            bt.logging.info({
+                "game_data_request": {
+                    "games_count": len(games),
+                    "markets_count": len(markets),
+                    "response_keys": list(response.keys()) if response else [],
+                }
+            })
+            
+            # Defensive check - should never happen but helps debug
+            if not response or not isinstance(response, dict) or "games" not in response:
+                bt.logging.error({
+                    "game_data_handler_unexpected": {
+                        "response_type": type(response).__name__,
+                        "response": str(response)[:200] if response else "None",
                     }
                 })
-                
-                # Defensive check - should never happen but helps debug
-                if not response or not isinstance(response, dict) or "games" not in response:
-                    bt.logging.error({
-                        "game_data_handler_unexpected": {
-                            "response_type": type(response).__name__,
-                            "response": str(response)[:200] if response else "None",
-                        }
-                    })
-                
-                return response
-            finally:
-                # Clean up the engine
-                await engine.dispose()
+            
+            return response
             
         except Exception as e:
             bt.logging.warning({"game_data_handler_error": str(e)})
             return {"error": str(e)}
     
-    async def _fetch_upcoming_games(self, engine: Any, now: datetime) -> List[Dict]:
+    async def _fetch_upcoming_games(self, now: datetime) -> List[Dict]:
         """Fetch scheduled games within the lookahead window."""
         until = now + timedelta(days=self.LOOKAHEAD_DAYS)
-        
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                _SELECT_UPCOMING_GAMES,
-                {
-                    "now": now,
-                    "until": until,
-                    "limit": self.MAX_EVENTS_PER_REQUEST,
-                },
-            )
-            rows = result.mappings().all()
+
+        rows = await self._database.read(
+            _SELECT_UPCOMING_GAMES,
+            params={
+                "now": now,
+                "until": until,
+                "limit": self.MAX_EVENTS_PER_REQUEST,
+            },
+            mappings=True,
+        )
         return [dict(r) for r in rows]
     
-    async def _fetch_markets(self, engine: Any, event_ids: List[int]) -> List[Dict]:
+    async def _fetch_markets(self, event_ids: List[int]) -> List[Dict]:
         """Fetch markets for the given event IDs."""
         if not event_ids:
             return []
-        
-        async with engine.connect() as conn:
-            result = await conn.execute(
-                _SELECT_MARKETS_FOR_EVENTS,
-                {"event_ids": event_ids},
-            )
-            rows = result.mappings().all()
+
+        rows = await self._database.read(
+            _SELECT_MARKETS_FOR_EVENTS,
+            params={"event_ids": event_ids},
+            mappings=True,
+        )
         return [dict(r) for r in rows]
     
     def _build_response(
