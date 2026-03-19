@@ -88,6 +88,19 @@ class IPTablesManager:
                     timeout=10,
                 )
                 
+                # Flush stale rules from previous process lifetimes.
+                # Bans are temporary and not DB-backed, so a clean slate
+                # on startup is correct; the fail2ban logic will re-ban
+                # bad actors as they misbehave.
+                stale = self._count_chain_rules()
+                subprocess.run(
+                    ["iptables", "-F", self.chain_name],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if stale:
+                    bt.logging.info({"iptables_flush": {"stale_rules_cleared": stale}})
+                
                 # Check if chain is already linked to INPUT
                 result = subprocess.run(
                     ["iptables", "-C", "INPUT", "-j", self.chain_name],
@@ -129,6 +142,20 @@ class IPTablesManager:
                 })
                 return False
     
+    def _count_chain_rules(self) -> int:
+        """Count existing rules in the chain (best-effort)."""
+        try:
+            result = subprocess.run(
+                ["iptables", "-L", self.chain_name, "-n", "--line-numbers"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return 0
+            # Header is 2 lines (Chain + column names), rest are rules
+            return max(0, len(result.stdout.strip().splitlines()) - 2)
+        except Exception:
+            return 0
+
     def block_ip(self, ip: str, duration_sec: int = 86400) -> bool:
         """Block an IP address at the iptables level.
         

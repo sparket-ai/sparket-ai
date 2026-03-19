@@ -269,6 +269,8 @@ class BaseValidatorNeuron(BaseNeuron):
                 raise
 
             # Initialize observability syncer (if enabled)
+            import time as _init_time
+            self._start_time = _init_time.time()
             self._syncer = None
             try:
                 obs_cfg = getattr(getattr(self.app_config, "core", None), "observability", None)
@@ -972,14 +974,25 @@ class BaseValidatorNeuron(BaseNeuron):
                             _hk = getattr(getattr(self, "wallet", None), "hotkey", None)
                             _hk_addr = getattr(_hk, "ss58_address", str(_hk or ""))
                             _uptime = _obs_time.time() - self._start_time
+                            bt.logging.info({"syncer_heartbeat": {"step": self.step, "hotkey": _hk_addr[:12] + "..."}})
                             self.loop.run_until_complete(
                                 asyncio.wait_for(
                                     self._syncer.push_heartbeat(_hk_addr, self.step, _uptime),
                                     timeout=5,
                                 )
                             )
-                    except Exception:
-                        pass  # never block the loop for heartbeat
+                            # Also push full data sync (roster, scores, submissions, events)
+                            # This ensures data reaches the dashboard even when scoring runs
+                            # in a separate worker process that doesn't have the syncer.
+                            bt.logging.info({"syncer_push_scores": {"step": self.step}})
+                            self.loop.run_until_complete(
+                                asyncio.wait_for(
+                                    self._syncer.push_scores(_hk_addr),
+                                    timeout=30,
+                                )
+                            )
+                    except Exception as e:
+                        bt.logging.warning({"syncer_heartbeat_caller_error": str(e)})
 
                     # Use async sleep to allow event loop to process other tasks
                     self.loop.run_until_complete(asyncio.sleep(30))

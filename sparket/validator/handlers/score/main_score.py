@@ -187,9 +187,10 @@ class MainScoreHandler:
                             hotkey = str(hotkey or "")
                     import asyncio as _aio
 
+                    bt.logging.info({"syncer_push_scores": {"hotkey": str(hotkey)[:12] + "..."}})
                     _aio.ensure_future(self._syncer.push_scores(hotkey, results))
                 except Exception as e:
-                    bt.logging.debug({"syncer_push_trigger_error": str(e)})
+                    bt.logging.warning({"syncer_push_trigger_error": str(e)})
 
             elapsed = time.time() - start_time
             results["elapsed_sec"] = round(elapsed, 2)

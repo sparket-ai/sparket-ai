@@ -451,6 +451,7 @@ class DataSyncer:
                         json=payload.model_dump(mode="json"),
                     )
                     resp.raise_for_status()
+                bt.logging.info({"syncer_push_ok": {"endpoint": endpoint, "status": resp.status_code}})
                 return
             except Exception as e:
                 if attempt == 2:

@@ -64,15 +64,18 @@ class CooldownConfig:
     hotkey_backoff_multiplier: float = 2.0  # Exponential backoff factor
     
     # Per-IP aggregate settings (catches hotkey cycling)
-    ip_failure_threshold: int = 50  # Total failures from IP before cooldown
+    # These base thresholds are scaled up by the number of registered hotkeys
+    # seen from the IP so multi-miner deployments are not penalised.
+    ip_failure_threshold: int = 50  # Total failures from IP before cooldown (base)
     ip_failure_window_sec: int = 300  # Window for counting IP failures (5 min)
-    ip_distinct_hotkey_threshold: int = 5  # Distinct failing hotkeys to flag IP
+    ip_distinct_hotkey_threshold: int = 10  # Distinct *unregistered* failing hotkeys to flag IP
     ip_initial_cooldown_sec: int = 60  # IP cooldown duration
     ip_max_cooldown_sec: int = 3600  # Max IP cooldown
+    ip_max_hotkeys_scale: int = 20  # Cap on registered-hotkey scaling factor
     
     # Fail2ban settings - ban miners who persistently ignore cooldowns
-    # If a miner keeps submitting while in cooldown, they get banned for 24 hours
-    fail2ban_violation_threshold: int = 20  # Cooldown violations before 24h ban
+    # Base thresholds are scaled by registered hotkey count per IP.
+    fail2ban_violation_threshold: int = 50  # Cooldown violations before ban (base)
     fail2ban_violation_window_sec: int = 3600  # Window to count violations (1 hour)
     fail2ban_duration_sec: int = 86400  # Ban duration (24 hours)
     
