@@ -402,6 +402,133 @@ class TimeWeightParams(BaseModel):
     )
 
 
+class CobbDouglasParams(BaseModel):
+    """Cobb-Douglas multiplicative scoring exponents and thresholds."""
+
+    accuracy_exponent: Decimal = Field(
+        default=Decimal("0.5"),
+        ge=Decimal("0.1"),
+        le=Decimal("3.0"),
+        description="Exponent for Accuracy pillar (compressed — soft prerequisite).",
+    )
+    edge_exponent: Decimal = Field(
+        default=Decimal("1.0"),
+        ge=Decimal("0.1"),
+        le=Decimal("3.0"),
+        description="Exponent for Edge pillar (linear — core sharpness).",
+    )
+    timeliness_exponent: Decimal = Field(
+        default=Decimal("0.5"),
+        ge=Decimal("0.1"),
+        le=Decimal("3.0"),
+        description="Exponent for Timeliness pillar (compressed — soft prerequisite).",
+    )
+    uniqueness_exponent: Decimal = Field(
+        default=Decimal("1.5"),
+        ge=Decimal("0.1"),
+        le=Decimal("3.0"),
+        description="Exponent for Uniqueness pillar (amplified — strongest discriminator).",
+    )
+    marginal_exponent: Decimal = Field(
+        default=Decimal("1.0"),
+        ge=Decimal("0.1"),
+        le=Decimal("3.0"),
+        description="Exponent for Marginal contribution pillar (linear — validates uniqueness).",
+    )
+    floor_threshold: Decimal = Field(
+        default=Decimal("0.30"),
+        ge=Decimal("0.15"),
+        le=Decimal("0.50"),
+        description="Brier score hard floor. Miners above this get zero weight.",
+    )
+    epsilon: Decimal = Field(
+        default=Decimal("0.01"),
+        ge=Decimal("0.001"),
+        le=Decimal("0.1"),
+        description="Minimum dimension value before exponentiation (prevents log(0)).",
+    )
+
+
+class CompositeSOSParams(BaseModel):
+    """Parameters for composite SOS (Uniqueness dimension)."""
+
+    w_market: Decimal = Field(
+        default=Decimal("0.2"),
+        ge=Decimal("0"),
+        le=Decimal("1"),
+        description="Weight for SOS_market (independence from market consensus).",
+    )
+    w_crowd: Decimal = Field(
+        default=Decimal("0.5"),
+        ge=Decimal("0"),
+        le=Decimal("1"),
+        description="Weight for SOS_crowd (independence from other miners).",
+    )
+    w_cluster: Decimal = Field(
+        default=Decimal("0.3"),
+        ge=Decimal("0"),
+        le=Decimal("1"),
+        description="Weight for SOS_cluster (spectral clustering penalty).",
+    )
+    correlation_window_days: int = Field(
+        default=30,
+        ge=7,
+        le=90,
+        description="Window for computing pairwise miner correlations.",
+    )
+    min_common_markets: int = Field(
+        default=10,
+        ge=3,
+        le=100,
+        description="Minimum common markets for a valid correlation estimate.",
+    )
+    cluster_correlation_threshold: Decimal = Field(
+        default=Decimal("0.85"),
+        ge=Decimal("0.5"),
+        le=Decimal("0.99"),
+        description="Pairwise correlation above which miners are considered clustered.",
+    )
+
+
+class ShapleyParams(BaseModel):
+    """Parameters for Monte Carlo Shapley contribution scoring."""
+
+    k_permutations: int = Field(
+        default=500,
+        ge=50,
+        le=5000,
+        description="Number of random permutations for Shapley estimation.",
+    )
+    seed_prefix: int = Field(
+        default=42,
+        description="Seed prefix for deterministic RNG (combined with epoch + market_id).",
+    )
+    min_miners_for_shapley: int = Field(
+        default=5,
+        ge=2,
+        le=50,
+        description="Minimum active miners required to compute Shapley values.",
+    )
+    max_parallel_markets: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Number of settled markets to process in parallel.",
+    )
+    batch_interval_minutes: int = Field(
+        default=60,
+        ge=15,
+        le=1440,
+        description="How often to run Shapley computation (minutes).",
+    )
+    prob_clamp_epsilon: Decimal = Field(
+        default=Decimal("0.005"),
+        ge=Decimal("0.001"),
+        le=Decimal("0.05"),
+        description="Clamp probabilities to [ε, 1-ε] before logit transform.",
+    )
+
+
 class SecurityBounds(BaseModel):
     """Security bounds for input validation and exploit prevention."""
 
@@ -558,6 +685,9 @@ class ScoringParams(BaseModel):
     ingest: IngestParams = Field(default_factory=IngestParams)
     retention: RetentionParams = Field(default_factory=RetentionParams)
     weight_emission: WeightEmissionParams = Field(default_factory=WeightEmissionParams)
+    cobb_douglas: CobbDouglasParams = Field(default_factory=CobbDouglasParams)
+    composite_sos: CompositeSOSParams = Field(default_factory=CompositeSOSParams)
+    shapley: ShapleyParams = Field(default_factory=ShapleyParams)
 
 
 # Default instance for easy import
@@ -586,6 +716,9 @@ __all__ = [
     "IngestParams",
     "RetentionParams",
     "WeightEmissionParams",
+    "CobbDouglasParams",
+    "CompositeSOSParams",
+    "ShapleyParams",
     "ScoringParams",
     "DEFAULT_SCORING_PARAMS",
     "get_scoring_params",

@@ -175,7 +175,40 @@ async def _schedule_scoring_work(database: Any) -> None:
     else:
         orig_counts = {}
 
-    # Stage 3: Skill score (singleton)
+    # Stage 3: Composite Uniqueness (singleton — depends on Originality)
+    cu_counts = await queue.get_status_counts(WorkType.COMPOSITE_UNIQUENESS, chunk_prefix=prefix_like)
+    if not cu_counts:
+        await queue.create_work_batch(
+            WorkType.COMPOSITE_UNIQUENESS,
+            chunk_keys=[f"{prefix}all"],
+            params={
+                "run_id": run_id,
+                "window_start": orig_start.isoformat(),
+                "window_end": orig_end.isoformat(),
+            },
+            priority=70,
+        )
+        cu_counts = await queue.get_status_counts(WorkType.COMPOSITE_UNIQUENESS, chunk_prefix=prefix_like)
+    if not _is_stage_complete(cu_counts):
+        return
+
+    # Stage 4: Shapley Contribution (singleton — runs on settled markets)
+    shapley_counts = await queue.get_status_counts(WorkType.SHAPLEY, chunk_prefix=prefix_like)
+    if not shapley_counts:
+        await queue.create_work_batch(
+            WorkType.SHAPLEY,
+            chunk_keys=[f"{prefix}all"],
+            params={
+                "run_id": run_id,
+                "as_of": roll_end.isoformat(),
+            },
+            priority=60,
+        )
+        shapley_counts = await queue.get_status_counts(WorkType.SHAPLEY, chunk_prefix=prefix_like)
+    if not _is_stage_complete(shapley_counts):
+        return
+
+    # Stage 5: Skill score (singleton — Cobb-Douglas, depends on all prior stages)
     skill_counts = await queue.get_status_counts(WorkType.SKILL, chunk_prefix=prefix_like)
     if not skill_counts:
         await queue.create_work_batch(

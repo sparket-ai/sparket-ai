@@ -19,6 +19,10 @@ async def test_creates_rolling_and_skill_work_when_due():
         side_effect=[
             {},  # rolling initial
             {"completed": 1},  # rolling after create
+            {},  # composite_uniqueness initial
+            {"completed": 1},  # composite_uniqueness after create
+            {},  # shapley initial
+            {"completed": 1},  # shapley after create
             {},  # skill initial
         ]
     )
@@ -27,9 +31,11 @@ async def test_creates_rolling_and_skill_work_when_due():
     with patch("sparket.validator.scoring.worker.scheduler.WorkQueue", return_value=mock_queue):
         await scheduler._schedule_scoring_work(mock_db)
 
-    assert mock_queue.create_work_batch.call_count == 2
+    assert mock_queue.create_work_batch.call_count == 4
     call_types = [call.args[0] for call in mock_queue.create_work_batch.call_args_list]
     assert WorkType.ROLLING in call_types
+    assert WorkType.COMPOSITE_UNIQUENESS in call_types
+    assert WorkType.SHAPLEY in call_types
     assert WorkType.SKILL in call_types
 
 

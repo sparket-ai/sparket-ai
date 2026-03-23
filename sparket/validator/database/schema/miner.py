@@ -361,10 +361,47 @@ class MinerRollingScore(Base):
         Numeric,
         comment="Skill dimension = PSS_norm (outcome relative skill)",
     )
+    # Cobb-Douglas dimensions (new pillars for Shapley scoring overhaul)
+    uniqueness_dim: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Uniqueness dimension = composite SOS [0,1]",
+    )
+    marginal_dim: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Marginal dimension = normalised Shapley contribution [0,1]",
+    )
+    # Composite SOS sub-components
+    sos_crowd: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Mean pairwise miner correlation score (1 - mean|corr|)",
+    )
+    sos_cluster: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Cluster penalty score (1 - ClusterPenalty)",
+    )
+    sos_composite: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Weighted blend: 0.2*market + 0.5*crowd + 0.3*cluster",
+    )
+    # Shapley rolling aggregates
+    shapley_mean: Mapped[float | None] = mapped_column(
+        Numeric,
+        comment="Time-decayed rolling Shapley value",
+    )
+    # Cluster assignment
+    cluster_id: Mapped[int | None] = mapped_column(
+        Integer,
+        comment="Assigned cluster ID from spectral clustering",
+    )
+    cluster_size: Mapped[int | None] = mapped_column(
+        Integer,
+        server_default="1",
+        comment="Size of assigned cluster (1 = singleton)",
+    )
     # Final composite score
     skill_score: Mapped[float | None] = mapped_column(
         Numeric,
-        comment="Final skill score = 0.10*ForecastDim + 0.10*SkillDim + 0.50*EconDim + 0.30*InfoDim",
+        comment="Final skill score (Cobb-Douglas: A^0.5 * E^1.0 * T^0.5 * U^1.5 * M^1.0)",
     )
     composite_score: Mapped[float | None] = mapped_column(
         Numeric,
@@ -385,6 +422,8 @@ class MinerRollingScore(Base):
     sos_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for SOS")
     lead_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for lead ratio")
     lead_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for lead ratio")
+    shapley_ws: Mapped[float | None] = mapped_column(Numeric, comment="Weighted sum for Shapley values")
+    shapley_wt: Mapped[float | None] = mapped_column(Numeric, comment="Weight sum for Shapley values")
     # Versioning for consensus
     score_version: Mapped[int] = mapped_column(
         Integer,

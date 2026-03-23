@@ -228,6 +228,9 @@ class MinerMetrics(BaseModel):
     sos_score: float = 0.5
     lead_score: float = 0.5
     brier_mean: float = 0.0
+    # Cobb-Douglas new dimensions (None = not yet computed, use bootstrap defaults)
+    uniqueness_dim: float | None = None
+    marginal_dim: float | None = None
 
     @classmethod
     def from_accumulator(cls, acc: AccumulatorEntry) -> MinerMetrics:
