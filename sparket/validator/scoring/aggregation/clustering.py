@@ -83,3 +83,41 @@ def compute_cluster_penalty(
                 return 0.0
             return (size - 1) / size
     return 0.0  # Not found — treat as singleton
+
+
+def compute_soft_cluster_penalty(
+    corr_matrix: NDArray,
+    miner_idx: int,
+    soft_floor: float = 0.5,
+    soft_ceil: float = 0.95,
+) -> float:
+    """Continuous cluster penalty based on max pairwise correlation.
+
+    Unlike the hard threshold in detect_clusters (binary: in or out),
+    this ramps linearly between soft_floor and soft_ceil, closing the
+    gap where attackers calibrate noise to sit just below the threshold.
+
+    Args:
+        corr_matrix: Shape (N, N) pairwise correlation matrix.
+        miner_idx: Index of the target miner.
+        soft_floor: Correlation below which penalty is 0.
+        soft_ceil: Correlation at or above which penalty is 1.
+
+    Returns:
+        Penalty in [0, 1]. 0 = no suspicious peers. 1 = strong sybil signal.
+    """
+    n = corr_matrix.shape[0]
+    if n <= 1:
+        return 0.0
+
+    others = np.abs(np.concatenate([
+        corr_matrix[miner_idx, :miner_idx],
+        corr_matrix[miner_idx, miner_idx + 1:],
+    ]))
+    max_corr = float(others.max())
+
+    if max_corr <= soft_floor:
+        return 0.0
+    if max_corr >= soft_ceil:
+        return 1.0
+    return (max_corr - soft_floor) / (soft_ceil - soft_floor)

@@ -21,8 +21,13 @@ from sqlalchemy import text
 
 from sparket.validator.config.scoring_params import get_scoring_params
 
-from ..aggregation.correlation import compute_pairwise_correlations, compute_sos_crowd
-from ..aggregation.clustering import detect_clusters, compute_cluster_penalty
+from ..aggregation.correlation import (
+    compute_pairwise_correlations,
+    compute_pairwise_correlations_windowed,
+    compute_sos_crowd,
+    compute_low_overlap_penalty,
+)
+from ..aggregation.clustering import detect_clusters, compute_cluster_penalty, compute_soft_cluster_penalty
 from ..determinism import get_canonical_window_bounds
 from .base import ScoringJob
 
@@ -43,7 +48,8 @@ _SELECT_MINER_SUBMISSIONS_FOR_CORR = text(
         miner_id,
         market_id,
         side,
-        AVG(imp_prob) AS avg_prob
+        AVG(imp_prob) AS avg_prob,
+        MIN(submitted_at) AS first_seen
     FROM miner_submission
     WHERE submitted_at >= :window_start
       AND submitted_at < :window_end
@@ -139,6 +145,7 @@ class CompositeUniquenessJob(ScoringJob):
         # Build submission matrix: for each miner, one probability per (market, side)
         # Use (market_id, side) as the "market" axis for correlation
         all_market_sides: Dict[tuple, int] = {}  # (market_id, side) -> index
+        market_side_first_seen: Dict[tuple, datetime] = {}
         miner_data: Dict[int, Dict[tuple, float]] = defaultdict(dict)
         miner_hotkeys: Dict[int, str] = {}
 
@@ -146,6 +153,8 @@ class CompositeUniquenessJob(ScoringJob):
             ms_key = (row["market_id"], row["side"])
             if ms_key not in all_market_sides:
                 all_market_sides[ms_key] = len(all_market_sides)
+            if ms_key not in market_side_first_seen and row.get("first_seen"):
+                market_side_first_seen[ms_key] = row["first_seen"]
             miner_data[row["miner_id"]][ms_key] = float(row["avg_prob"])
 
         n_market_sides = len(all_market_sides)
@@ -170,18 +179,40 @@ class CompositeUniquenessJob(ScoringJob):
             submissions[str(mid)] = arr
 
         market_ids_arr = np.arange(n_market_sides)
+        min_common = int(sos_params.min_common_markets)
 
-        # 2. Compute pairwise correlations
-        corr_matrix = compute_pairwise_correlations(
-            submissions,
-            market_ids_arr,
-            min_common=int(sos_params.min_common_markets),
-        )
+        # 2. Compute pairwise correlations (with sub-window rotation detection)
+        if sos_params.enable_sub_window_correlation and market_side_first_seen:
+            # Build half-mask: True = first half of window, False = second half
+            window_mid = window_start + (window_end - window_start) / 2
+            market_half_mask = np.zeros(n_market_sides, dtype=bool)
+            for ms_key, idx in all_market_sides.items():
+                fs = market_side_first_seen.get(ms_key)
+                if fs is not None:
+                    market_half_mask[idx] = fs < window_mid
+                else:
+                    market_half_mask[idx] = True  # Default to first half
+            corr_matrix = compute_pairwise_correlations_windowed(
+                submissions, market_ids_arr, market_half_mask,
+                min_common=min_common,
+            )
+        else:
+            corr_matrix = compute_pairwise_correlations(
+                submissions, market_ids_arr, min_common=min_common,
+            )
 
-        # 3. Detect clusters
+        # 3. Detect clusters (hard threshold, used for logging + hard penalty)
         clusters = detect_clusters(
             corr_matrix,
             threshold=float(sos_params.cluster_correlation_threshold),
+        )
+
+        # 3b. Compute low-overlap penalties (Fix 1)
+        overlap_penalties = compute_low_overlap_penalty(
+            submissions,
+            min_common=min_common,
+            low_overlap_threshold=float(sos_params.low_overlap_threshold),
+            max_unscoreable=float(sos_params.low_overlap_max_unscoreable),
         )
 
         # 4. Fetch existing SOS_market scores
@@ -202,15 +233,24 @@ class CompositeUniquenessJob(ScoringJob):
         w_market = float(sos_params.w_market)
         w_crowd = float(sos_params.w_crowd)
         w_cluster = float(sos_params.w_cluster)
+        max_corr_weight = float(sos_params.crowd_max_corr_weight)
+        soft_floor = float(sos_params.cluster_soft_floor)
+        soft_ceil = float(sos_params.cluster_soft_ceil)
 
         sorted_miner_ids_str = sorted(submissions.keys())
 
         for i, mid in enumerate(miner_ids):
             idx_in_corr = sorted_miner_ids_str.index(str(mid))
 
-            sos_crowd_val = compute_sos_crowd(corr_matrix, idx_in_corr)
-            cluster_penalty = compute_cluster_penalty(clusters, idx_in_corr)
-            sos_cluster_val = 1.0 - cluster_penalty
+            # SOS_crowd with max-corr blending (Fix 4) and overlap penalty (Fix 1)
+            sos_crowd_val = compute_sos_crowd(corr_matrix, idx_in_corr, max_corr_weight)
+            overlap_pen = overlap_penalties.get(str(mid), 0.0)
+            sos_crowd_val *= (1.0 - overlap_pen)
+
+            # SOS_cluster: max of hard (connected component) and soft (continuous ramp) penalties (Fix 2)
+            hard_penalty = compute_cluster_penalty(clusters, idx_in_corr)
+            soft_penalty = compute_soft_cluster_penalty(corr_matrix, idx_in_corr, soft_floor, soft_ceil)
+            sos_cluster_val = 1.0 - max(hard_penalty, soft_penalty)
 
             sos_market_val = sos_market_map.get(mid, 0.5)
             sos_composite = (

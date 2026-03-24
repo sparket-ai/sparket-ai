@@ -488,6 +488,40 @@ class CompositeSOSParams(BaseModel):
         le=Decimal("0.99"),
         description="Pairwise correlation above which miners are considered clustered.",
     )
+    crowd_max_corr_weight: Decimal = Field(
+        default=Decimal("0.6"),
+        ge=Decimal("0"),
+        le=Decimal("1"),
+        description="Weight for max pairwise correlation in SOS_crowd. Prevents dilution in large networks.",
+    )
+    cluster_soft_floor: Decimal = Field(
+        default=Decimal("0.5"),
+        ge=Decimal("0.2"),
+        le=Decimal("0.8"),
+        description="Correlation below which no soft cluster penalty is applied.",
+    )
+    cluster_soft_ceil: Decimal = Field(
+        default=Decimal("0.95"),
+        ge=Decimal("0.8"),
+        le=Decimal("1.0"),
+        description="Correlation at or above which soft cluster penalty reaches 1.0.",
+    )
+    low_overlap_threshold: Decimal = Field(
+        default=Decimal("0.15"),
+        ge=Decimal("0"),
+        le=Decimal("0.5"),
+        description="Baseline unscoreable peer fraction before overlap penalty kicks in.",
+    )
+    low_overlap_max_unscoreable: Decimal = Field(
+        default=Decimal("0.5"),
+        ge=Decimal("0.2"),
+        le=Decimal("1.0"),
+        description="Unscoreable peer fraction at which overlap penalty reaches 1.0.",
+    )
+    enable_sub_window_correlation: bool = Field(
+        default=True,
+        description="Enable sub-window correlation to detect rotation attacks.",
+    )
 
 
 class ShapleyParams(BaseModel):
