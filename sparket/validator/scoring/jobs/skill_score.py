@@ -1,23 +1,17 @@
 """Final skill score computation job.
 
-Combines all dimension scores into the final SkillScore using 4 dimensions:
+Combines all dimension scores into the final SkillScore using Cobb-Douglas
+multiplicative architecture with 5 pillars:
 
-1. ForecastDim (Accuracy): How accurate are predictions vs outcome?
-   - FQ: 1 - 2*brier_mean (transforms Brier to [0,1] scale)
-   - CAL: Calibration score
+1. Accuracy (exponent 0.5): ForecastDim from Brier + calibration
+2. Edge (exponent 1.0): EconDim from CLE + market efficiency
+3. Timeliness (exponent 0.5): Blend of PSS (relative skill) + lead ratio
+4. Uniqueness (exponent 1.5): Composite SOS (market + crowd + cluster)
+5. Marginal (exponent 1.0): Shapley contribution to aggregate quality
 
-2. SkillDim (Relative Skill): How well does miner beat the market?
-   - PSS: Time-adjusted PSS vs matched snapshot
+SkillScore = Accuracy^0.5 × Edge^1.0 × Timeliness^0.5 × Uniqueness^1.5 × Marginal^1.0
 
-3. EconDim (Economic Edge): Does miner beat the closing line?
-   - EDGE: CLE-based edge score
-   - MES: Market efficiency score
-
-4. InfoDim (Information Value): Does miner have information advantage?
-   - SOS: Source of signal (independence)
-   - LEAD: Lead-lag ratio
-
-SkillScore = w_forecast * ForecastDim + w_skill * SkillDim + w_econ * EconDim + w_info * InfoDim
+Hard floor: miners with rolling Brier > 0.30 get SkillScore = 0.
 """
 
 from __future__ import annotations
@@ -52,7 +46,9 @@ _SELECT_ROLLING_SCORES = text(
         es_adj,
         mes_mean,
         sos_score,
-        lead_score
+        lead_score,
+        uniqueness_dim,
+        marginal_dim
     FROM miner_rolling_score
     WHERE as_of = :as_of
       AND window_days = :window_days
@@ -73,6 +69,8 @@ _UPDATE_SKILL_SCORE = text(
         info_dim = :info_dim,
         skill_dim = :skill_dim,
         skill_score = :skill_score,
+        uniqueness_dim = COALESCE(uniqueness_dim, :uniqueness_dim_default),
+        marginal_dim = COALESCE(marginal_dim, :marginal_dim_default),
         score_version = score_version + 1
     WHERE miner_id = :miner_id
       AND miner_hotkey = :miner_hotkey
@@ -158,6 +156,8 @@ class SkillScoreJob(ScoringJob):
                 sos_score=self._to_float_safe(row["sos_score"], 0.5),
                 lead_score=self._to_float_safe(row["lead_score"], 0.5),
                 brier_mean=self._to_float_safe(row.get("brier_mean"), 0.0),
+                uniqueness_dim=self._to_float_or_none(row.get("uniqueness_dim")),
+                marginal_dim=self._to_float_or_none(row.get("marginal_dim")),
             ))
 
         # Use shared normalization logic (same code path as auditors)
@@ -191,21 +191,54 @@ class SkillScoreJob(ScoringJob):
         sos_norm = np.clip(sos, 0, 1)
         lead_norm = np.clip(lead, 0, 1)
 
-        # Dimension combining
+        # Dimension combining (within-dimension additive)
         dim_weights = self.params.dimension_weights
-        skill_weights = self.params.skill_score_weights
 
         forecast_dim = float(dim_weights.w_fq) * fq_norm + float(dim_weights.w_cal) * cal_norm
         skill_dim = pss_norm
         econ_dim = float(dim_weights.w_edge) * es_norm + float(dim_weights.w_mes) * mes_norm
         info_dim = float(dim_weights.w_sos) * sos_norm + float(dim_weights.w_lead) * lead_norm
 
-        skill_score = (
-            float(skill_weights.w_outcome_accuracy) * forecast_dim
-            + float(skill_weights.w_outcome_relative) * skill_dim
-            + float(skill_weights.w_odds_edge) * econ_dim
-            + float(skill_weights.w_info_adv) * info_dim
+        # Map to Cobb-Douglas 5 pillars
+        accuracy_dim = forecast_dim
+        edge_dim = econ_dim
+        timeliness_dim = 0.5 * skill_dim + 0.5 * lead_norm
+
+        # Uniqueness and Marginal from pre-computed columns (or bootstrap defaults)
+        uniqueness_arr = np.array(
+            [m.uniqueness_dim if m.uniqueness_dim is not None else float(sos[i])
+             for i, m in enumerate(sorted_metrics)],
+            dtype=np.float64,
         )
+        marginal_arr = np.array(
+            [m.marginal_dim if m.marginal_dim is not None else 0.5
+             for i, m in enumerate(sorted_metrics)],
+            dtype=np.float64,
+        )
+
+        # Cobb-Douglas scoring
+        cd = self.params.cobb_douglas
+        eps = float(cd.epsilon)
+        brier_arr = np.array([m.brier_mean for m in sorted_metrics], dtype=np.float64)
+
+        # Clamp all dimensions to [epsilon, 1.0]
+        acc_c = np.clip(accuracy_dim, eps, 1.0)
+        edge_c = np.clip(edge_dim, eps, 1.0)
+        time_c = np.clip(timeliness_dim, eps, 1.0)
+        uniq_c = np.clip(uniqueness_arr, eps, 1.0)
+        marg_c = np.clip(marginal_arr, eps, 1.0)
+
+        skill_score = (
+            acc_c ** float(cd.accuracy_exponent)
+            * edge_c ** float(cd.edge_exponent)
+            * time_c ** float(cd.timeliness_exponent)
+            * uniq_c ** float(cd.uniqueness_exponent)
+            * marg_c ** float(cd.marginal_exponent)
+        )
+
+        # Hard accuracy floor
+        floor_mask = brier_arr > float(cd.floor_threshold)
+        skill_score[floor_mask] = 0.0
 
         # Persist results - map back from sorted order to original key order
         hotkey_to_idx = {m.hotkey: i for i, m in enumerate(sorted_metrics)}
@@ -229,6 +262,8 @@ class SkillScoreJob(ScoringJob):
                     "info_dim": float(info_dim[i]),
                     "skill_dim": float(skill_dim[i]),
                     "skill_score": float(skill_score[i]),
+                    "uniqueness_dim_default": float(uniq_c[i]),
+                    "marginal_dim_default": float(marg_c[i]),
                 },
             )
             self.items_processed += 1
@@ -241,6 +276,15 @@ class SkillScoreJob(ScoringJob):
             return float(val)
         except (ValueError, TypeError):
             return default
+
+    def _to_float_or_none(self, val: Any) -> float | None:
+        """Safely convert to float, returning None if not set."""
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
 
 
 __all__ = ["SkillScoreJob"]

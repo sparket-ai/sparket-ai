@@ -25,12 +25,14 @@ from sparket.validator.config.scoring_params import ScoringParams, get_scoring_p
 
 class WorkType(str, Enum):
     """Types of batch work."""
-    SNAPSHOT = "snapshot"           # Compute ground truth snapshot
-    OUTCOME = "outcome"             # Score settled outcomes
-    ROLLING = "rolling"             # Rolling aggregates
-    CALIBRATION = "calibration"     # Calibration + sharpness
-    ORIGINALITY = "originality"     # Originality + lead-lag
-    SKILL = "skill"                 # Final skill score
+    SNAPSHOT = "snapshot"                       # Compute ground truth snapshot
+    OUTCOME = "outcome"                         # Score settled outcomes
+    ROLLING = "rolling"                         # Rolling aggregates
+    CALIBRATION = "calibration"                 # Calibration + sharpness
+    ORIGINALITY = "originality"                 # Originality + lead-lag
+    COMPOSITE_UNIQUENESS = "composite_uniqueness"  # Pairwise correlation + clustering + composite SOS
+    SHAPLEY = "shapley"                         # Monte Carlo Shapley contribution scoring
+    SKILL = "skill"                             # Final skill score (Cobb-Douglas)
 
 
 @dataclass

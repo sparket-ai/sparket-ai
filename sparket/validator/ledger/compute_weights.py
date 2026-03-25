@@ -199,19 +199,65 @@ def compute_weights(
     sos_norm = np.clip(sos, 0, 1)
     lead_norm = np.clip(lead, 0, 1)
 
-    # Step 2: Combine into dimensions
-    forecast_dim = w_fq * fq_norm + w_cal * cal_norm
-    skill_dim = pss_norm
-    econ_dim = w_edge * es_norm + w_mes * mes_norm
-    info_dim = w_sos * sos_norm + w_lead * lead_norm
+    # Step 2: Combine into dimensions (within-dimension additive, across-dimension multiplicative)
+    forecast_dim = w_fq * fq_norm + w_cal * cal_norm      # → Accuracy pillar
+    skill_dim = pss_norm                                    # feeds into Accuracy/Edge
+    econ_dim = w_edge * es_norm + w_mes * mes_norm          # → Edge pillar
+    info_dim = w_sos * sos_norm + w_lead * lead_norm        # → Timeliness pillar
 
-    # Step 3: Final skill score
-    skill_score = (
-        w_outcome_accuracy * forecast_dim
-        + w_outcome_relative * skill_dim
-        + w_odds_edge * econ_dim
-        + w_info_adv * info_dim
+    # Map to Cobb-Douglas 5-pillar names
+    # Accuracy = forecast_dim (Brier + calibration)
+    # Edge = econ_dim (CLE + market efficiency)
+    # Timeliness = info_dim (lead-lag component) blended with skill_dim
+    accuracy_dim = forecast_dim
+    edge_dim_arr = econ_dim
+    timeliness_dim = w_sos * sos_norm * 0 + w_lead * lead_norm  # lead component only
+    # Actually, keep timeliness as the lead-lag + skill blend for backward compat
+    timeliness_dim = 0.5 * skill_dim + 0.5 * (lead_norm)
+
+    # Uniqueness and Marginal from new Cobb-Douglas dimensions
+    uniqueness_arr = np.array(
+        [m.uniqueness_dim if m.uniqueness_dim is not None else float(sos[i])
+         for i, m in enumerate(sorted_metrics)],
+        dtype=np.float64,
     )
+    marginal_arr = np.array(
+        [m.marginal_dim if m.marginal_dim is not None else 0.5
+         for i, m in enumerate(sorted_metrics)],
+        dtype=np.float64,
+    )
+
+    # Step 3: Cobb-Douglas scoring
+    cd_params = params.get("cobb_douglas", {})
+    accuracy_exp = float(cd_params.get("accuracy_exponent", 0.5))
+    edge_exp = float(cd_params.get("edge_exponent", 1.0))
+    timeliness_exp = float(cd_params.get("timeliness_exponent", 0.5))
+    uniqueness_exp = float(cd_params.get("uniqueness_exponent", 1.5))
+    marginal_exp = float(cd_params.get("marginal_exponent", 1.0))
+    floor_threshold = float(cd_params.get("floor_threshold", 0.30))
+    epsilon = float(cd_params.get("epsilon", 0.01))
+
+    brier_arr = np.array([m.brier_mean for m in sorted_metrics], dtype=np.float64)
+
+    # Clamp all dimensions to [epsilon, 1.0]
+    accuracy_clamped = np.clip(accuracy_dim, epsilon, 1.0)
+    edge_clamped = np.clip(edge_dim_arr, epsilon, 1.0)
+    timeliness_clamped = np.clip(timeliness_dim, epsilon, 1.0)
+    uniqueness_clamped = np.clip(uniqueness_arr, epsilon, 1.0)
+    marginal_clamped = np.clip(marginal_arr, epsilon, 1.0)
+
+    # Cobb-Douglas product
+    skill_score = (
+        accuracy_clamped ** accuracy_exp
+        * edge_clamped ** edge_exp
+        * timeliness_clamped ** timeliness_exp
+        * uniqueness_clamped ** uniqueness_exp
+        * marginal_clamped ** marginal_exp
+    )
+
+    # Hard accuracy floor: miners with Brier > threshold get zero
+    floor_mask = brier_arr > floor_threshold
+    skill_score[floor_mask] = 0.0
 
     # Record intermediates for audit trail
     for i, uid in enumerate(uids):
@@ -221,6 +267,11 @@ def compute_weights(
             "skill_dim": float(skill_dim[i]),
             "econ_dim": float(econ_dim[i]),
             "info_dim": float(info_dim[i]),
+            "accuracy_dim": float(accuracy_clamped[i]),
+            "edge_dim": float(edge_clamped[i]),
+            "timeliness_dim": float(timeliness_clamped[i]),
+            "uniqueness_dim": float(uniqueness_clamped[i]),
+            "marginal_dim": float(marginal_clamped[i]),
         }
 
     # Step 4: Build weight array indexed by UID (zeros for missing)
