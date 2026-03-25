@@ -95,12 +95,12 @@ class MainScoreHandler:
                 
                 # Score CLV for submissions with ground truth closing
                 odds_handler = OddsScoreHandler(self.database)
-                clv_scored = await odds_handler.score_batch(since=since, limit=5000)
+                clv_scored = await odds_handler.score_batch(since=since, limit=25000)
                 results["clv_scored"] = clv_scored
                 
                 # Score outcomes for submissions with settled markets
                 outcome_handler = OutcomeScoreHandler(self.database)
-                outcome_scored = await outcome_handler.score_batch(since=since, limit=5000)
+                outcome_scored = await outcome_handler.score_batch(since=since, limit=25000)
                 results["outcome_scored"] = outcome_scored
                 
                 SUBMISSIONS_SCORED.inc(clv_scored + outcome_scored)

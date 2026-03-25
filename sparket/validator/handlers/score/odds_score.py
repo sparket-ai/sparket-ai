@@ -133,7 +133,7 @@ class OddsScoreHandler:
     async def score_batch(
         self,
         since: datetime,
-        limit: int = 1000,
+        limit: int = 25000,
     ) -> int:
         """Score a batch of unscored submissions.
 
@@ -197,8 +197,8 @@ class OddsScoreHandler:
 
         # Compute CLV/CLE
         try:
-            miner_odds = to_decimal(submission.get("odds_eu"), "odds_eu")
-            miner_prob = to_decimal(submission.get("imp_prob"), "imp_prob")
+            miner_odds = float(to_decimal(submission.get("odds_eu"), "odds_eu"))
+            miner_prob = float(to_decimal(submission.get("imp_prob"), "imp_prob"))
             submitted_at = submission.get("submitted_at")
 
             if not isinstance(submitted_at, datetime):
@@ -207,10 +207,10 @@ class OddsScoreHandler:
             clv_result = compute_clv(
                 miner_odds=miner_odds,
                 miner_prob=miner_prob,
-                truth_odds=gt["odds_consensus"],
-                truth_prob=gt["prob_consensus"],
-                submitted_at=submitted_at,
-                event_start=gt["start_time_utc"],
+                truth_odds=float(gt["odds_consensus"]),
+                truth_prob=float(gt["prob_consensus"]),
+                submitted_ts=submitted_at.timestamp(),
+                event_start_ts=gt["start_time_utc"].timestamp(),
             )
 
             if clv_result is None:
@@ -248,17 +248,17 @@ class OddsScoreHandler:
             return False
 
         try:
-            miner_odds = to_decimal(row["odds_eu"], "odds_eu")
-            miner_prob = to_decimal(row["imp_prob"], "imp_prob")
+            miner_odds = float(to_decimal(row["odds_eu"], "odds_eu"))
+            miner_prob = float(to_decimal(row["imp_prob"], "imp_prob"))
             submitted_at = row["submitted_at"]
 
             clv_result = compute_clv(
                 miner_odds=miner_odds,
                 miner_prob=miner_prob,
-                truth_odds=gt["odds_consensus"],
-                truth_prob=gt["prob_consensus"],
-                submitted_at=submitted_at,
-                event_start=gt["start_time_utc"],
+                truth_odds=float(gt["odds_consensus"]),
+                truth_prob=float(gt["prob_consensus"]),
+                submitted_ts=submitted_at.timestamp(),
+                event_start_ts=gt["start_time_utc"].timestamp(),
             )
 
             if clv_result is None:
