@@ -39,6 +39,7 @@ class TestSportsbookRegistration:
         ing.database = mock_db
         ing.provider_id = 1
         ing.client = client
+        ing._known_sportsbook_codes = None
         return ing
 
     def _make_odds(self, sportsbook: str):

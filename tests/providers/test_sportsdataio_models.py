@@ -76,7 +76,7 @@ def test_game_normalizes_enum_aliases():
         {
             "GameID": 42,
             "Season": 2025,
-            "SeasonType": 1,  # numeric enum value
+            "SeasonType": 2,  # SportsDataIO: 1=Pre, 2=Regular, 3=Post
             "Status": "F/OT",  # provider shorthand
             "Date": "2025-09-14T20:20:00Z",
             "HomeTeam": "KC",
