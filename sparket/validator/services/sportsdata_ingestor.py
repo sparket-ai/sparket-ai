@@ -272,6 +272,12 @@ class SportsDataIngestor:
     # Public entrypoint
     # ------------------------------------------------------------------
     async def run_once(self, *, now: Optional[datetime] = None) -> None:
+        from sparket.validator.observability.metrics import (
+            PROVIDER_REQUESTS, PROVIDER_ERRORS, PROVIDER_LATENCY,
+            EVENTS_ACTIVE, MARKETS_ACTIVE,
+        )
+        import time as _obs_time
+
         now = now or datetime.now(timezone.utc)
         self._evict_expired_cache(now)
         cycle_start = now
@@ -287,7 +293,9 @@ class SportsDataIngestor:
                 "snapshot_success": 0,
                 "snapshot_missed": 0,
             }
+            _t0 = _obs_time.monotonic()
             try:
+                PROVIDER_REQUESTS.labels(endpoint=f"sdio/{league_code.value}").inc()
                 await self._ensure_league_id(state)
                 if state.league_id is None:
                     metrics["error"] = "missing_league_id"
@@ -300,8 +308,12 @@ class SportsDataIngestor:
             except Exception as exc:
                 metrics["error"] = str(exc)
                 total_errors += 1
+                PROVIDER_ERRORS.labels(endpoint=f"sdio/{league_code.value}").inc()
                 bt.logging.warning({"sdio_ingestor_error": str(exc), "league": league_code.value})
             finally:
+                PROVIDER_LATENCY.labels(endpoint=f"sdio/{league_code.value}").observe(
+                    _obs_time.monotonic() - _t0
+                )
                 bt.logging.info({"sdio_ingestor_league": metrics})
         elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
         bt.logging.info({
@@ -313,6 +325,9 @@ class SportsDataIngestor:
                 "total_tracked": len(self.tracked_events),
             }
         })
+
+        # Update active event/market gauges
+        EVENTS_ACTIVE.set(len(self.tracked_events))
 
     # ------------------------------------------------------------------
     # Schedule + catalog

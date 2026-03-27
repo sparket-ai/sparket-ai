@@ -113,6 +113,7 @@ module.exports = {
       exec_mode: 'fork',
       
       // Enable logging via CLI args (boolean flags, no values needed)
+      // Use real localnet chain (validator registered on netuid 2)
       args: '--logging.trace --logging.debug --logging.info',
       
       env: {
@@ -130,8 +131,16 @@ module.exports = {
         SPARKET_DATABASE__PORT: '5435',
         SPARKET_DATABASE__NAME: 'sparket_test',
         // Force wallet for validator (UID 1)
-        SPARKET_WALLET__NAME: 'local-validator',
+        SPARKET_WALLET__NAME: 'test-localnet',
         SPARKET_WALLET__HOTKEY: 'default',
+        // Observability sync to host server (pass through from .env)
+        SPARKET_OBSERVABILITY__SYNC_ENABLED: envVars.SPARKET_OBSERVABILITY__SYNC_ENABLED || 'false',
+        SPARKET_OBSERVABILITY__SYNC_API_URL: envVars.SPARKET_OBSERVABILITY__SYNC_API_URL || '',
+        SPARKET_OBSERVABILITY__SYNC_API_KEY: envVars.SPARKET_OBSERVABILITY__SYNC_API_KEY || '',
+        SPARKET_OBSERVABILITY__SYNC_TIMEOUT_SECONDS: envVars.SPARKET_OBSERVABILITY__SYNC_TIMEOUT_SECONDS || '10',
+        SPARKET_OBSERVABILITY__HEARTBEAT_INTERVAL_STEPS: envVars.SPARKET_OBSERVABILITY__HEARTBEAT_INTERVAL_STEPS || '5',
+        // SportsDataIO key for ingestor data
+        SDIO_API_KEY: envVars.SDIO_API_KEY || '',
       },
       
       autorestart: true,

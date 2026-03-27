@@ -182,3 +182,8 @@ sparket/data/test/*.db-*
 # Ledger and auditor runtime data (generated at runtime, never committed)
 sparket/data/ledger/
 sparket/data/auditor/
+
+# Internal strategy docs (team-only, never publish)
+docs/SPARKET_WARBOOK.md
+docs/burn_scaling_strategy.md
+docs/comms_strategy.md

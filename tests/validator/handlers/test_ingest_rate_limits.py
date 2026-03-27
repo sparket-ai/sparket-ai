@@ -40,14 +40,10 @@ async def test_outcome_daily_event_cap_blocks():
 
 
 @pytest.mark.asyncio
-async def test_outcome_handle_synapse_rate_limited():
+async def test_outcome_handle_synapse_queues_for_processing():
+    """handle_synapse now queues to inbox; rate limiting is deferred to processing."""
     db = MagicMock()
-    db.read = AsyncMock(
-        side_effect=[
-            [{"event_id": 1, "status": "finished", "start_time_utc": datetime.now(timezone.utc)}],
-            [{"total": 50}],
-        ]
-    )
+    db.write = AsyncMock(return_value=1)
     handler = IngestOutcomeHandler(db)
     syn = SparketSynapse(
         type=SparketSynapseType.OUTCOME_PUSH,
@@ -56,5 +52,6 @@ async def test_outcome_handle_synapse_rate_limited():
     result = await handler.handle_synapse(syn)
     assert result is not None
     payload = result.event_data.get("payload", {})
-    assert payload.get("accepted") is False
-    assert payload.get("reason") == "rate_limited"
+    assert payload.get("accepted") is True
+    assert payload.get("queued") is True
+    assert payload.get("event_id") == 1

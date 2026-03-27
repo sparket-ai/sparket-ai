@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 # Schema version - bump on breaking changes to ledger format
 # ---------------------------------------------------------------------------
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +118,10 @@ class AccumulatorEntry(BaseModel):
     lead_score: float = 0.5
     cal_score: float = 0.5
     sharp_score: float = 0.5
+
+    # Cobb-Douglas dimensions (populated by Shapley/composite uniqueness jobs)
+    uniqueness_dim: float | None = None
+    marginal_dim: float | None = None
 
     def derive_means(self) -> None:
         """Compute derived means from accumulator pairs.
@@ -228,6 +232,9 @@ class MinerMetrics(BaseModel):
     sos_score: float = 0.5
     lead_score: float = 0.5
     brier_mean: float = 0.0
+    # Cobb-Douglas new dimensions (None = not yet computed, use bootstrap defaults)
+    uniqueness_dim: float | None = None
+    marginal_dim: float | None = None
 
     @classmethod
     def from_accumulator(cls, acc: AccumulatorEntry) -> MinerMetrics:
@@ -245,6 +252,8 @@ class MinerMetrics(BaseModel):
             sos_score=acc.sos_score,
             lead_score=acc.lead_score,
             brier_mean=acc.brier_mean,
+            uniqueness_dim=acc.uniqueness_dim,
+            marginal_dim=acc.marginal_dim,
         )
 
 

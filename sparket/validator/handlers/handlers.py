@@ -13,13 +13,13 @@ from sparket.validator.handlers.data.game_data import GameDataHandler
 
 
 class Handlers:
-    def __init__(self, database: Any):
+    def __init__(self, database: Any, syncer: Any = None):
         self.database = database
         self.ingest_odds_handler = IngestOddsHandler(database)
         self.ingest_outcome_handler = IngestOutcomeHandler(database)
         self.odds_score_handler = OddsScoreHandler(database)
         self.outcome_score_handler = OutcomeScoreHandler(database)
-        self.main_score_handler = MainScoreHandler(database)
+        self.main_score_handler = MainScoreHandler(database, syncer=syncer)
         self.set_weights_handler = SetWeightsHandler(database)
         self.miner_management_handler = MinerManagementHandler(database)
         self.sync_metagraph_handler = SyncMetagraphHandler(database)

@@ -30,9 +30,10 @@ class MainScoreHandler:
     5. Skill score (final normalized composite)
     """
 
-    def __init__(self, database: Any):
+    def __init__(self, database: Any, syncer: Optional[Any] = None):
         self.database = database
         self._logger = logging.getLogger("main_score")
+        self._syncer = syncer
 
     async def run(self, emit_weights: bool = False, validator: Optional[Any] = None) -> dict:
         """Execute the full scoring pipeline.
@@ -44,8 +45,15 @@ class MainScoreHandler:
         Returns:
             Summary dict with job results
         """
+        from sparket.validator.observability.metrics import (
+            SCORING_CYCLE_DURATION, SCORING_JOB_DURATION, SCORING_ERRORS,
+            SUBMISSIONS_SCORED,
+        )
+
         bt.logging.info({"main_score": "start"})
         start_time = time.time()
+        _cycle_timer = SCORING_CYCLE_DURATION.time()
+        _cycle_timer.__enter__()
         
         results = {
             "snapshots": 0,
@@ -87,13 +95,15 @@ class MainScoreHandler:
                 
                 # Score CLV for submissions with ground truth closing
                 odds_handler = OddsScoreHandler(self.database)
-                clv_scored = await odds_handler.score_batch(since=since, limit=5000)
+                clv_scored = await odds_handler.score_batch(since=since, limit=25000)
                 results["clv_scored"] = clv_scored
                 
                 # Score outcomes for submissions with settled markets
                 outcome_handler = OutcomeScoreHandler(self.database)
-                outcome_scored = await outcome_handler.score_batch(since=since, limit=5000)
+                outcome_scored = await outcome_handler.score_batch(since=since, limit=25000)
                 results["outcome_scored"] = outcome_scored
+                
+                SUBMISSIONS_SCORED.inc(clv_scored + outcome_scored)
                 
                 bt.logging.info({
                     "main_score_batch": {
@@ -117,7 +127,8 @@ class MainScoreHandler:
                 job_name = job_class.__name__
                 try:
                     job = job_class(self.database, self._logger)
-                    await job.run()
+                    with SCORING_JOB_DURATION.labels(job=job_name).time():
+                        await job.run()
                     results["jobs_completed"] += 1
                     bt.logging.info({"main_score_job": job_name, "status": "completed"})
                 except Exception as e:
@@ -162,6 +173,25 @@ class MainScoreHandler:
                     results["errors"].append(f"weight_emission: {e}")
                     bt.logging.warning({"main_score_weights_error": str(e)})
 
+            # Phase 4: Push data to dashboard API (fire-and-forget)
+            if self._syncer is not None and getattr(self._syncer, "enabled", False):
+                try:
+                    hotkey = ""
+                    if validator is not None:
+                        hotkey = getattr(
+                            getattr(validator, "wallet", None), "hotkey", None
+                        )
+                        if hotkey and hasattr(hotkey, "ss58_address"):
+                            hotkey = hotkey.ss58_address
+                        else:
+                            hotkey = str(hotkey or "")
+                    import asyncio as _aio
+
+                    bt.logging.info({"syncer_push_scores": {"hotkey": str(hotkey)[:12] + "..."}})
+                    _aio.ensure_future(self._syncer.push_scores(hotkey, results))
+                except Exception as e:
+                    bt.logging.warning({"syncer_push_trigger_error": str(e)})
+
             elapsed = time.time() - start_time
             results["elapsed_sec"] = round(elapsed, 2)
             
@@ -176,9 +206,13 @@ class MainScoreHandler:
             
         except Exception as e:
             bt.logging.error({"main_score_error": str(e)})
+            SCORING_ERRORS.inc()
             results["errors"].append(f"main: {e}")
             return results
         finally:
+            _cycle_timer.__exit__(None, None, None)
+            if results.get("jobs_failed", 0) > 0:
+                SCORING_ERRORS.inc()
             bt.logging.info({"main_score": "end"})
 
     async def _export_ledger(

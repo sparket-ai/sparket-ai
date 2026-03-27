@@ -303,22 +303,22 @@ class SnapshotPipeline:
         
         return snapshot_count
 
-    async def capture_late_closing_snapshots(self, limit: int = 50) -> int:
+    async def capture_late_closing_snapshots(self, limit: int = 200) -> int:
         """Capture closing snapshots for markets that already started but were missed.
-        
+
         This is a recovery mechanism for events where we failed to capture
         a closing snapshot before the event started. Uses the most recent
         provider quote before event start as the "closing" line.
-        
+
         Args:
             limit: Max number of markets to process per call
-            
+
         Returns:
             Number of closing snapshots created
         """
         now = datetime.now(timezone.utc)
-        # Look back up to 7 days for missed events
-        min_time = now - timedelta(days=7)
+        # Look back up to 30 days to match the rolling aggregates window
+        min_time = now - timedelta(days=30)
         
         bias_states = await self._load_bias_states()
         bias_version = max((s.version for s in bias_states.values()), default=1)
@@ -441,8 +441,11 @@ class SnapshotPipeline:
         is_closing: bool,
     ) -> List[SnapshotResult]:
         """Compute consensus snapshots for all sides of a market."""
-        # Get recent quotes (last 2 hours for freshness)
-        since = snapshot_ts - timedelta(hours=2)
+        # For closing snapshots use a wider window (24h) since provider
+        # quotes may stop hours before event start; for regular periodic
+        # snapshots keep the 2h freshness window.
+        lookback_hours = 24 if is_closing else 2
+        since = snapshot_ts - timedelta(hours=lookback_hours)
         
         quotes_raw = await self.db.read(
             _SELECT_MARKET_QUOTES,

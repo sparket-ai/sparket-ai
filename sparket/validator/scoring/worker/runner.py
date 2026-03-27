@@ -375,6 +375,33 @@ class ScoringWorkerRunner:
                     miner_id_max=miner_id_max,
                     job_id_override=job_id,
                 )
+            elif work_type == WorkType.COMPOSITE_UNIQUENESS:
+                from sparket.validator.scoring.jobs.composite_uniqueness import (
+                    CompositeUniquenessJob,
+                )
+
+                job_id = self._make_job_id(CompositeUniquenessJob.JOB_ID, chunk_key)
+                self._current_job = job_id
+                job = CompositeUniquenessJob(
+                    self.db,
+                    logger,
+                    window_start=window_start,
+                    window_end=window_end,
+                    job_id_override=job_id,
+                )
+            elif work_type == WorkType.SHAPLEY:
+                from sparket.validator.scoring.jobs.shapley_contribution import (
+                    ShapleyContributionJob,
+                )
+
+                job_id = self._make_job_id(ShapleyContributionJob.JOB_ID, chunk_key)
+                self._current_job = job_id
+                job = ShapleyContributionJob(
+                    self.db,
+                    logger,
+                    as_of=as_of,
+                    job_id_override=job_id,
+                )
             elif work_type == WorkType.SKILL:
                 from sparket.validator.scoring.jobs.skill_score import SkillScoreJob
 

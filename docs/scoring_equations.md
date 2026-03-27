@@ -98,16 +98,65 @@ $$z = \frac{x - \mu}{\sigma}$$
 $$Norm = \frac{1}{1 + e^{-\alpha z}}$$
 $$Norm = \frac{rank(x)}{n + 1}$$
 
-## Step 12: Build dimension scores
-Normalized components are grouped into four dimensions aligned to the tasks.
+## Step 12: Build intermediate dimension scores
+Normalized components are grouped into intermediate dimensions that feed
+the Cobb-Douglas pillars.
 
 $$ForecastDim = w_{fq} \cdot FQ_{norm} + w_{cal} \cdot CAL$$
 $$SkillDim = PSS_{norm}$$
 $$EconDim = w_{edge} \cdot ES_{norm} + w_{mes} \cdot MES$$
-$$InfoDim = w_{sos} \cdot SOS + w_{lead} \cdot Lead$$
 
-## Step 13: Final SkillScore
-The final SkillScore is the single composite used for chain weights.
+Default sub-dimension weights: `w_fq = 0.60`, `w_cal = 0.40`,
+`w_edge = 0.70`, `w_mes = 0.30`.
 
-$$SkillScore = w_{outcome\_accuracy}\cdot ForecastDim + w_{outcome\_relative}\cdot SkillDim + w_{odds\_edge}\cdot EconDim + w_{info\_adv}\cdot InfoDim$$
-$$w_{outcome\_accuracy} = 0.10,\; w_{outcome\_relative} = 0.10,\; w_{odds\_edge} = 0.50,\; w_{info\_adv} = 0.30$$
+## Step 13: Map to Cobb-Douglas 5-pillar dimensions
+The intermediate dimensions are mapped to 5 Cobb-Douglas pillars.
+
+$$Accuracy = ForecastDim$$
+$$Edge = EconDim$$
+$$Timeliness = 0.5 \cdot SkillDim + 0.5 \cdot Lead$$
+$$Uniqueness = \begin{cases} uniqueness\_dim, & \text{if computed by Shapley jobs} \\ SOS, & \text{fallback} \end{cases}$$
+$$Marginal = \begin{cases} marginal\_dim, & \text{if computed by Shapley jobs} \\ 0.5, & \text{fallback (neutral)} \end{cases}$$
+
+All pillar values are clamped to $[\epsilon, 1.0]$ where $\epsilon = 0.01$.
+
+**Uniqueness** measures how independent a miner's predictions are from the
+crowd. It is computed via pairwise correlation analysis, cluster detection,
+and sub-window overlap scoring. When the composite uniqueness jobs have not
+yet run (bootstrap period), the simple SOS originality score is used.
+
+**Marginal** measures the miner's leave-one-out contribution to the crowd
+forecast via Shapley value estimation. During bootstrap, a neutral default
+of 0.5 is used.
+
+## Step 14: Cobb-Douglas SkillScore
+The final SkillScore is a multiplicative product of the 5 pillar dimensions,
+each raised to a configured exponent. This means weakness in any single
+pillar significantly reduces the total score — balanced miners are rewarded.
+
+$$SkillScore = Accuracy^{\alpha} \cdot Edge^{\beta} \cdot Timeliness^{\gamma} \cdot Uniqueness^{\delta} \cdot Marginal^{\eta}$$
+
+Default exponents:
+$$\alpha = 0.5,\; \beta = 1.0,\; \gamma = 0.5,\; \delta = 1.5,\; \eta = 1.0$$
+
+The exponents reflect the relative importance of each pillar:
+- **Edge** ($\beta = 1.0$) and **Marginal** ($\eta = 1.0$): linear scaling — core value signals.
+- **Uniqueness** ($\delta = 1.5$): super-linear — strong anti-sybil incentive.
+- **Accuracy** ($\alpha = 0.5$) and **Timeliness** ($\gamma = 0.5$): sub-linear — necessary
+  but diminishing returns above a threshold.
+
+## Step 15: Hard accuracy floor
+Miners with mean Brier score above the floor threshold are zeroed out,
+regardless of their Cobb-Douglas score.
+
+$$SkillScore_i = 0 \quad \text{if } Brier_{mean,i} > 0.30$$
+
+This prevents miners who are fundamentally miscalibrated from earning
+any weight, even if they score well on other pillars.
+
+## Step 16: Weight encoding
+After SkillScore is computed:
+1. L1 normalize across all miners
+2. Apply burn rate (default 90% to burn UID)
+3. Enforce `max_weight_limit` and `min_allowed_weights`
+4. Convert to uint16 for chain submission

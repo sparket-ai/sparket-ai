@@ -343,5 +343,218 @@ class TestSecurityManagerEnforcement:
         assert allowed is True
 
 
+class TestMultiMinerIPScaling:
+    """Tests for IP threshold scaling with multi-miner deployments."""
+
+    @pytest.mark.asyncio
+    async def test_registered_miners_no_ip_cooldown(self):
+        """18 registered miners on one IP should NOT trigger IP cooldown
+        from the distinct-hotkey detector (only unregistered count)."""
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                ip_failure_threshold=10000,
+                ip_distinct_hotkey_threshold=5,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+        # Register 18 hotkeys
+        hotkeys = [f"hotkey{i}" for i in range(18)]
+        manager._registered_hotkeys = set(hotkeys)
+
+        # Each miner has one token_invalid failure
+        for hk in hotkeys:
+            await manager.record_failure(hk, "10.0.0.1", "token_invalid")
+
+        # IP should NOT be in cooldown (all hotkeys are registered)
+        in_cooldown, reason, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is False
+
+    @pytest.mark.asyncio
+    async def test_unregistered_hotkeys_trigger_ip_cooldown(self):
+        """Unregistered failing hotkeys should still trigger IP cooldown."""
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                ip_failure_threshold=10000,
+                ip_distinct_hotkey_threshold=3,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+        # No hotkeys registered
+
+        await manager.record_failure("rogue1", "10.0.0.1", "token_invalid")
+        await manager.record_failure("rogue2", "10.0.0.1", "token_invalid")
+        await manager.record_failure("rogue3", "10.0.0.1", "token_invalid")
+
+        in_cooldown, reason, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is True
+        assert reason == "ip_cooldown"
+
+    @pytest.mark.asyncio
+    async def test_ip_failure_threshold_scales(self):
+        """IP failure threshold should scale by registered hotkey count."""
+        base_threshold = 5
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                ip_failure_threshold=base_threshold,
+                ip_distinct_hotkey_threshold=100,
+                ip_max_hotkeys_scale=20,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+        hotkeys = [f"hk{i}" for i in range(10)]
+        manager._registered_hotkeys = set(hotkeys)
+
+        # Register each hotkey by causing one failure (so IPRecord sees them)
+        for hk in hotkeys:
+            await manager.record_failure(hk, "10.0.0.1", "token_invalid")
+
+        # effective threshold = 5 * 10 = 50
+        # We've recorded 10 failures so far, well under 50
+        in_cooldown, _, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is False
+
+        # Push to 49 (still under scaled threshold)
+        for _ in range(39):
+            await manager.record_failure("hk0", "10.0.0.1", "token_invalid")
+
+        in_cooldown, _, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is False
+
+        # 50th failure should trigger
+        await manager.record_failure("hk0", "10.0.0.1", "token_invalid")
+        in_cooldown, _, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is True
+
+    @pytest.mark.asyncio
+    async def test_scale_capped_at_max(self):
+        """Scaling factor should be capped at ip_max_hotkeys_scale."""
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                ip_failure_threshold=10,
+                ip_distinct_hotkey_threshold=1000,
+                ip_max_hotkeys_scale=5,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+        # 30 registered hotkeys but cap is 5 -> effective threshold = 50
+        hotkeys = [f"hk{i}" for i in range(30)]
+        manager._registered_hotkeys = set(hotkeys)
+
+        for hk in hotkeys:
+            await manager.record_failure(hk, "10.0.0.1", "token_invalid")
+
+        # 30 failures, threshold should be 10*5=50 (not 10*30=300)
+        in_cooldown, _, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is False
+
+        # Push to 50
+        for _ in range(20):
+            await manager.record_failure("hk0", "10.0.0.1", "token_invalid")
+
+        in_cooldown, _, _ = manager.is_in_cooldown(None, "10.0.0.1")
+        assert in_cooldown is True
+
+    @pytest.mark.asyncio
+    async def test_fail2ban_targets_hotkey_when_all_registered(self):
+        """When all hotkeys on an IP are registered, fail2ban should ban
+        the individual hotkey, not the entire IP."""
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                fail2ban_violation_threshold=5,
+                fail2ban_violation_window_sec=3600,
+                ip_max_hotkeys_scale=1,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+        manager._registered_hotkeys = {"miner_a", "miner_b"}
+
+        # Populate IPRecord with registered hotkeys
+        ip_rec = manager._ip_records["10.0.0.1"]
+        ip_rec.registered_hotkeys_seen = {"miner_a", "miner_b"}
+        ip_rec.hotkeys_seen = {"miner_a", "miner_b"}
+
+        # Rack up violations on miner_a (exceed per-IP threshold)
+        for _ in range(6):
+            result = await manager.record_cooldown_violation("miner_a", "10.0.0.1")
+
+        # miner_a should be banned (hotkey-level)
+        assert "miner_a" in manager._blacklist_hotkeys
+
+        # IP should NOT be banned
+        assert "10.0.0.1" not in manager._blacklist_ips
+
+    @pytest.mark.asyncio
+    async def test_fail2ban_targets_ip_when_unregistered_present(self):
+        """When unregistered hotkeys are present, fail2ban should ban the IP."""
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                fail2ban_violation_threshold=6,
+                fail2ban_violation_window_sec=3600,
+                ip_max_hotkeys_scale=1,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+
+        ip_rec = manager._ip_records["10.0.0.1"]
+        ip_rec.hotkeys_seen = {"rogue1", "rogue2", "rogue3"}
+        ip_rec.registered_hotkeys_seen = set()
+
+        # Spread violations across 3 hotkeys so no individual hotkey
+        # reaches the per-hotkey threshold of 6, but IP aggregate does.
+        for rogue in ["rogue1", "rogue2", "rogue3"]:
+            for _ in range(2):
+                await manager.record_cooldown_violation(rogue, "10.0.0.1")
+
+        # IP should be banned (unregistered hotkeys present)
+        assert "10.0.0.1" in manager._blacklist_ips
+
+    @pytest.mark.asyncio
+    async def test_fail2ban_ip_threshold_scales(self):
+        """IP fail2ban threshold should scale by registered hotkeys.
+
+        Spread violations across enough hotkeys so no single one reaches
+        the per-hotkey threshold, while the IP aggregate crosses the
+        scaled threshold.
+        """
+        config = SecurityConfig(
+            cooldown=CooldownConfig(
+                fail2ban_violation_threshold=10,
+                fail2ban_violation_window_sec=3600,
+                ip_max_hotkeys_scale=20,
+            ),
+            enforce_registration=False,
+        )
+        manager = SecurityManager(config=config)
+        hotkeys = [f"hk{i}" for i in range(10)]
+        manager._registered_hotkeys = set(hotkeys)
+
+        ip_rec = manager._ip_records["10.0.0.1"]
+        ip_rec.registered_hotkeys_seen = set(hotkeys)
+        ip_rec.hotkeys_seen = set(hotkeys)
+
+        # Effective IP threshold = 10 * 10 = 100.
+        # Give each of 10 hotkeys 9 violations (under per-hotkey threshold of 10).
+        # Total IP violations = 90, still under 100.
+        for hk in hotkeys:
+            for _ in range(9):
+                await manager.record_cooldown_violation(hk, "10.0.0.1")
+
+        for hk in hotkeys:
+            assert hk not in manager._blacklist_hotkeys
+        assert "10.0.0.1" not in manager._blacklist_ips
+
+        # Push total to 100 with the 10th hotkey (hk0 goes to 10 -> per-hotkey
+        # triggers first, banning the hotkey not the IP).
+        await manager.record_cooldown_violation("hk0", "10.0.0.1")
+        assert "hk0" in manager._blacklist_hotkeys
+        assert "10.0.0.1" not in manager._blacklist_ips
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

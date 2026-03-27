@@ -102,7 +102,7 @@ class TestIngestOddsHandler:
         return IngestOddsHandler(db)
     
     async def test_handles_valid_odds_push(self, handler, db):
-        """Valid ODDS_PUSH should persist to miner_submission and emit event."""
+        """Valid ODDS_PUSH should queue to inbox and emit event."""
         synapse = make_synapse_with_hotkey(
             SparketSynapseType.ODDS_PUSH,
             {
@@ -119,40 +119,38 @@ class TestIngestOddsHandler:
             },
             "miner_hotkey_123",
         )
-        
+
         event = await handler.handle_synapse(synapse)
-        
+
         # Should emit MinerOddsPushed event
         assert event is not None
         assert event.event_data["miner_hotkey"] == "miner_hotkey_123"
-        
-        # Should have written 2 rows (home + away)
-        assert len(db.writes) == 2
-        
-        # Check first write params - miner_id derived from hotkey lookup (42)
+        assert event.event_data["payload"]["accepted"] is True
+        assert event.event_data["payload"]["queued"] is True
+
+        # Queue-based: single inbox write with full payload
+        assert len(db.writes) == 1
         params = db.writes[0]["params"]
-        assert params["miner_id"] == 42  # From hotkey lookup, not payload
-        assert params["market_id"] == 100
-        assert params["miner_hotkey"] == "miner_hotkey_123"
-        assert params["side"] in ("HOME", "AWAY")
-        assert params["odds_eu"] in (1.91, 2.05)
+        assert params["topic"] == "odds.submit"
+        assert "dedupe_key" in params
     
-    async def test_rejects_unregistered_miner(self, handler, db):
-        """Miner not registered in DB should be rejected."""
+    async def test_queues_unregistered_miner(self, handler, db):
+        """Unregistered miner still gets queued (validation deferred to processing)."""
         synapse = make_synapse_with_hotkey(
             SparketSynapseType.ODDS_PUSH,
             {"submissions": [{"market_id": 100, "prices": [{"side": "home", "odds_eu": 1.91}]}]},
             "unknown_miner",
         )
-        
+
         event = await handler.handle_synapse(synapse)
-        
+
+        # Queue-based: accepted into inbox, validation happens during processing
         assert event is not None
-        assert event.event_data["payload"]["error"] == "miner_not_registered"
-        assert len(db.writes) == 0
+        assert event.event_data["payload"]["accepted"] is True
+        assert len(db.writes) == 1
     
-    async def test_rejects_out_of_bounds_odds(self, handler, db):
-        """Odds outside bounds (1.01-1000) should be rejected."""
+    async def test_queues_out_of_bounds_odds(self, handler, db):
+        """Out-of-bounds odds still get queued (validation deferred to processing)."""
         synapse = make_synapse_with_hotkey(
             SparketSynapseType.ODDS_PUSH,
             {
@@ -168,11 +166,13 @@ class TestIngestOddsHandler:
             },
             "miner_hotkey_123",
         )
-        
+
         event = await handler.handle_synapse(synapse)
-        
-        # Both prices rejected
-        assert len(db.writes) == 0
+
+        # Queue-based: payload queued, bounds checking happens during processing
+        assert event is not None
+        assert event.event_data["payload"]["accepted"] is True
+        assert len(db.writes) == 1
     
     async def test_ignores_non_odds_synapse(self, handler, db):
         """Non-ODDS_PUSH synapses should return None."""
@@ -187,7 +187,7 @@ class TestIngestOddsHandler:
         assert len(db.writes) == 0
     
     async def test_handles_multiple_markets(self, handler, db):
-        """Multiple market submissions should all be persisted."""
+        """Multiple market submissions should be queued as single inbox entry."""
         synapse = make_synapse_with_hotkey(
             SparketSynapseType.ODDS_PUSH,
             {
@@ -212,15 +212,17 @@ class TestIngestOddsHandler:
             },
             "miner_123",
         )
-        
+
         event = await handler.handle_synapse(synapse)
-        
-        # Should have 4 writes (2 markets × 2 sides)
-        assert len(db.writes) == 4
-        
-        # Check market IDs
-        market_ids = {w["params"]["market_id"] for w in db.writes}
-        assert market_ids == {100, 101}
+
+        # Queue-based: single inbox write with full payload bundled
+        assert len(db.writes) == 1
+        params = db.writes[0]["params"]
+        assert params["topic"] == "odds.submit"
+        # Both markets included in the queued payload
+        import json
+        payload = json.loads(params["payload"])
+        assert len(payload["raw"]["submissions"]) == 2
 
 
 class TestIngestOutcomeHandler:
@@ -268,20 +270,22 @@ class TestIngestOutcomeHandler:
         assert params["topic"] == "outcome.submit"
         assert "dedupe_key" in params
     
-    async def test_rejects_nonexistent_event(self, handler, db):
-        """Outcome for non-existent event should be rejected."""
+    async def test_queues_nonexistent_event(self, handler, db):
+        """Outcome for non-existent event still gets queued (validation deferred)."""
         synapse = make_synapse_with_hotkey(
             SparketSynapseType.OUTCOME_PUSH,
             {"event_id": 999, "result": "HOME"},
             "miner_hotkey_xyz",
         )
-        
+
         event = await handler.handle_synapse(synapse)
-        
+
+        # Queue-based: accepted into inbox, event validation during processing
         assert event is not None
-        assert event.event_data["payload"]["accepted"] is False
-        assert event.event_data["payload"]["reason"] == "event_not_found_or_ineligible"
-        assert len(db.writes) == 0
+        assert event.event_data["payload"]["accepted"] is True
+        assert event.event_data["payload"]["queued"] is True
+        assert event.event_data["payload"]["event_id"] == 999
+        assert len(db.writes) == 1
     
     async def test_ignores_non_outcome_synapse(self, handler, db):
         """Non-OUTCOME_PUSH synapses should return None."""

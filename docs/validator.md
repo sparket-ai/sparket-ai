@@ -391,7 +391,8 @@ for moderate verbosity).
 
 **Fully verifiable (100% of math):**
 - Normalization across miners (z-score logistic or percentile)
-- Dimension combining (ForecastDim, SkillDim, EconDim, InfoDim)
+- Cobb-Douglas 5-pillar scoring (Accuracy, Edge, Timeliness, Uniqueness, Marginal)
+- Hard accuracy floor (Brier > 0.30 → zero)
 - Weight encoding (L1 normalize, burn rate, max weight limit, uint16)
 
 This catches fabricated outcome scores, normalization manipulation, and

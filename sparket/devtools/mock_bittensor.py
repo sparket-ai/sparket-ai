@@ -12,15 +12,23 @@ class MockSubtensor(bt.MockSubtensor):
     def __init__(self, netuid, n=16, wallet=None, network="mock"):
         super().__init__(network=network)
 
-        if not self.subnet_exists(netuid):
+        # bt 10.x subnet_exists() returns MagicMock; check chain_state directly
+        networks = self.chain_state.get("SubtensorModule", {}).get("NetworksAdded", {})
+        if netuid not in networks:
             self.create_subnet(netuid)
 
         # Register ourself (the validator) as a neuron at uid=0
         if wallet is not None:
+            hotkey_addr = wallet.hotkey.ss58_address
+            # In mock mode, coldkey may be encrypted; use hotkey as fallback
+            try:
+                coldkey_addr = wallet.coldkey.ss58_address
+            except Exception:
+                coldkey_addr = hotkey_addr
             self.force_register_neuron(
                 netuid=netuid,
-                hotkey=wallet.hotkey.ss58_address,
-                coldkey=wallet.coldkey.ss58_address,
+                hotkey_ss58=hotkey_addr,
+                coldkey_ss58=coldkey_addr,
                 balance=100000,
                 stake=100000,
             )
@@ -29,8 +37,8 @@ class MockSubtensor(bt.MockSubtensor):
         for i in range(1, n + 1):
             self.force_register_neuron(
                 netuid=netuid,
-                hotkey=f"miner-hotkey-{i}",
-                coldkey="mock-coldkey",
+                hotkey_ss58=f"miner-hotkey-{i}",
+                coldkey_ss58="mock-coldkey",
                 balance=100000,
                 stake=100000,
             )

@@ -154,3 +154,29 @@ class TestWeightVerificationPlugin:
         context = AuditorContext(checkpoint=_make_checkpoint(n_miners=0))
         result = await handler.on_cycle(context)
         assert result.status == "skip"
+
+    @pytest.mark.asyncio
+    async def test_shapley_dims_propagate_through_checkpoint(self):
+        """AccumulatorEntry uniqueness/marginal dims reach compute_weights."""
+        from sparket.validator.ledger.compute_weights import compute_weights
+        from sparket.validator.ledger.models import MinerMetrics
+
+        cp = _make_checkpoint(n_miners=3)
+        # Simulate Shapley jobs having populated these fields
+        for acc in cp.accumulators:
+            acc.uniqueness_dim = 0.75
+            acc.marginal_dim = 0.65
+
+        # Auditor path: from_accumulator → MinerMetrics
+        metrics = [MinerMetrics.from_accumulator(acc) for acc in cp.accumulators]
+        for m in metrics:
+            assert m.uniqueness_dim == 0.75, "uniqueness_dim not propagated"
+            assert m.marginal_dim == 0.65, "marginal_dim not propagated"
+
+        # Verify compute_weights uses the explicit values, not fallbacks
+        result = compute_weights(metrics, cp.scoring_config, cp.chain_params)
+        for uid in result.dimension_scores:
+            dims = result.dimension_scores[uid]
+            # 0.75 clamped to [epsilon, 1.0] should stay 0.75
+            assert abs(dims["uniqueness_dim"] - 0.75) < 1e-6
+            assert abs(dims["marginal_dim"] - 0.65) < 1e-6

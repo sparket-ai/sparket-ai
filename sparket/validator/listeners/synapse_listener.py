@@ -110,7 +110,13 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
         # Route: ODDS_PUSH
         # Keep request path lightweight: ingest only; scoring is batch/offline.
         if synapse_type == SparketSynapseType.ODDS_PUSH.value:
-            event = await validator.handlers.ingest_odds_handler.handle_synapse(synapse)
+            from sparket.validator.observability.metrics import (
+                SUBMISSIONS_RECEIVED, SUBMISSIONS_ACCEPTED, SUBMISSIONS_REJECTED,
+                SUBMISSION_PROCESSING,
+            )
+            SUBMISSIONS_RECEIVED.inc()
+            with SUBMISSION_PROCESSING.time():
+                event = await validator.handlers.ingest_odds_handler.handle_synapse(synapse)
             if event is not None:
                 event_payload = event.event_data.get("payload", {}) if hasattr(event, "event_data") else {}
                 accepted = bool(event_payload.get("accepted", False))
@@ -120,6 +126,7 @@ async def route_incoming_synapse(validator: Any, synapse: SparketSynapse):
                     "queued": bool(event_payload.get("queued", False)),
                 }
             else:
+                SUBMISSIONS_REJECTED.inc()
                 synapse.payload = {"success": True, "accepted": False, "message": "No valid submissions"}
             return event
 

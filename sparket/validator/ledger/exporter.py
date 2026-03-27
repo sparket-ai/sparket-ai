@@ -61,7 +61,8 @@ _SELECT_ACCUMULATORS = text("""
         mrs.es_ws, mrs.es_wt,
         mrs.mes_ws, mrs.mes_wt,
         mrs.sos_ws, mrs.sos_wt,
-        mrs.lead_ws, mrs.lead_wt
+        mrs.lead_ws, mrs.lead_wt,
+        mrs.uniqueness_dim, mrs.marginal_dim
     FROM miner m
     JOIN miner_rolling_score mrs
         ON m.miner_id = mrs.miner_id AND m.hotkey = mrs.miner_hotkey
@@ -254,6 +255,8 @@ class LedgerExporter:
                 lead_score=_safe_float(row.get("lead_ratio"), 0.5),
                 cal_score=_safe_float(row.get("cal_score"), 0.5),
                 sharp_score=_safe_float(row.get("sharp_score"), 0.5),
+                uniqueness_dim=row.get("uniqueness_dim"),
+                marginal_dim=row.get("marginal_dim"),
             )
             accumulators.append(acc)
 

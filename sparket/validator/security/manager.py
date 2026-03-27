@@ -75,11 +75,16 @@ class IPRecord(FailureRecord):
     
     hotkeys_seen: Set[str] = field(default_factory=set)
     failing_hotkeys: Set[str] = field(default_factory=set)
+    registered_hotkeys_seen: Set[str] = field(default_factory=set)
     
-    def add_failure_with_hotkey(self, failure_type: str, hotkey: str) -> None:
+    def add_failure_with_hotkey(
+        self, failure_type: str, hotkey: str, *, is_registered: bool = False,
+    ) -> None:
         self.add_failure(failure_type)
         self.hotkeys_seen.add(hotkey)
         self.failing_hotkeys.add(hotkey)
+        if is_registered:
+            self.registered_hotkeys_seen.add(hotkey)
 
 
 class SecurityManager:
@@ -391,7 +396,11 @@ class SecurityManager:
     ) -> Optional[str]:
         """Record a cooldown violation (submitting while in cooldown).
         
-        If violations exceed threshold, trigger a 24-hour ban.
+        If violations exceed threshold, trigger a ban.  Thresholds are
+        scaled by the number of registered hotkeys sharing the IP so
+        multi-miner deployments are not penalised.  When all violating
+        hotkeys are registered, only the worst-offending hotkey is banned
+        (not the entire IP) to avoid collateral damage.
         
         Returns:
             Ban reason if a ban was triggered, None otherwise
@@ -406,40 +415,67 @@ class SecurityManager:
         violation_count = 0
         
         with self._lock:
-            # Record hotkey violation - use defaultdict to auto-create record
+            # Record hotkey violation
             if hotkey:
                 record = self._hotkey_records[hotkey]
                 record.add_cooldown_violation()
-                violation_count = record.count_cooldown_violations(cfg.fail2ban_violation_window_sec)
+                hk_violations = record.count_cooldown_violations(cfg.fail2ban_violation_window_sec)
                 
-                if violation_count >= cfg.fail2ban_violation_threshold:
-                    ban_triggered = f"fail2ban: {violation_count} cooldown violations in {cfg.fail2ban_violation_window_sec}s"
+                if hk_violations >= cfg.fail2ban_violation_threshold:
+                    ban_triggered = (
+                        f"fail2ban: {hk_violations} cooldown violations "
+                        f"in {cfg.fail2ban_violation_window_sec}s"
+                    )
                     ban_identifier = hotkey
                     ban_type = "hotkey"
+                    violation_count = hk_violations
             
-            # Record IP violation (separate tracking) - use defaultdict to auto-create record
-            if ip:
+            # Record IP violation (separate tracking)
+            if ip and not ban_triggered:
                 ip_record = self._ip_records[ip]
                 ip_record.add_cooldown_violation()
-                ip_violation_count = ip_record.count_cooldown_violations(cfg.fail2ban_violation_window_sec)
+                ip_violations = ip_record.count_cooldown_violations(cfg.fail2ban_violation_window_sec)
                 
-                # IP gets banned if it exceeds threshold (catches hotkey cycling)
-                if ip_violation_count >= cfg.fail2ban_violation_threshold and not ban_triggered:
-                    ban_triggered = f"fail2ban: IP {ip_violation_count} cooldown violations in {cfg.fail2ban_violation_window_sec}s"
-                    ban_identifier = ip
-                    ban_type = "ip"
-                    violation_count = ip_violation_count
+                # Scale IP threshold by registered hotkey count
+                registered_on_ip = len(ip_record.registered_hotkeys_seen)
+                scale = (
+                    min(registered_on_ip, cfg.ip_max_hotkeys_scale)
+                    if registered_on_ip > 1 else 1
+                )
+                scaled_threshold = cfg.fail2ban_violation_threshold * scale
+                
+                if ip_violations >= scaled_threshold:
+                    # Determine whether any violating hotkeys are unregistered
+                    has_unregistered = bool(
+                        ip_record.hotkeys_seen - ip_record.registered_hotkeys_seen
+                    )
+                    if has_unregistered:
+                        # Genuine attack signal - ban the IP
+                        ban_triggered = (
+                            f"fail2ban: IP {ip_violations}/{scaled_threshold} "
+                            f"cooldown violations (unregistered hotkeys present)"
+                        )
+                        ban_identifier = ip
+                        ban_type = "ip"
+                        violation_count = ip_violations
+                    elif hotkey:
+                        # All hotkeys registered - ban the offending hotkey only
+                        ban_triggered = (
+                            f"fail2ban: {ip_violations}/{scaled_threshold} "
+                            f"IP cooldown violations (hotkey targeted)"
+                        )
+                        ban_identifier = hotkey
+                        ban_type = "hotkey"
+                        violation_count = ip_violations
         
-        # Trigger 24-hour ban if threshold exceeded
         if ban_triggered and ban_identifier and ban_type:
-            # Calculate expiry time (24 hours from now)
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=cfg.fail2ban_duration_sec)
             
             bt.logging.warning(
                 f"{LogColors.MINER_LABEL} fail2ban_triggered: "
                 f"{ban_type}={ban_identifier[:16] + '...' if len(ban_identifier) > 16 else ban_identifier}, "
                 f"violations={violation_count}, "
-                f"ban_duration={cfg.fail2ban_duration_sec}s (24h)"
+                f"ban_duration={cfg.fail2ban_duration_sec}s"
             )
             
             await self.add_to_blacklist(
@@ -496,22 +532,32 @@ class SecurityManager:
             # Record per-IP failure
             if ip:
                 ip_record = self._ip_records[ip]
-                ip_record.add_failure_with_hotkey(failure_type, hotkey or "unknown")
+                hk = hotkey or "unknown"
+                hk_registered = hk in self._registered_hotkeys
+                ip_record.add_failure_with_hotkey(failure_type, hk, is_registered=hk_registered)
                 
-                # Check for IP cooldown trigger
+                # Scale thresholds by how many registered miners share this IP
+                registered_on_ip = len(ip_record.registered_hotkeys_seen)
+                scale = min(registered_on_ip, cfg.ip_max_hotkeys_scale) if registered_on_ip > 1 else 1
+                scaled_ip_threshold = cfg.ip_failure_threshold * scale
+                
                 recent_ip_count = ip_record.count_recent(cfg.ip_failure_window_sec)
-                distinct_failing = len(ip_record.failing_hotkeys)
+                
+                # Only count *unregistered* failing hotkeys for cycling detection
+                unregistered_failing = ip_record.failing_hotkeys - ip_record.registered_hotkeys_seen
+                distinct_unregistered = len(unregistered_failing)
                 
                 should_cooldown_ip = (
-                    recent_ip_count >= cfg.ip_failure_threshold
-                    or distinct_failing >= cfg.ip_distinct_hotkey_threshold
+                    recent_ip_count >= scaled_ip_threshold
+                    or distinct_unregistered >= cfg.ip_distinct_hotkey_threshold
                 )
                 
                 if should_cooldown_ip and ip_record.cooldown_until <= time.time():
                     duration = self._trigger_cooldown(ip_record, cfg, is_ip=True)
                     bt.logging.warning(
                         f"{LogColors.MINER_LABEL} ip_cooldown_triggered: ip={ip}, "
-                        f"failures={recent_ip_count}, distinct_hotkeys={distinct_failing}, "
+                        f"failures={recent_ip_count}/{scaled_ip_threshold}, "
+                        f"unregistered_failing={distinct_unregistered}, "
                         f"duration={duration:.0f}s"
                     )
         
