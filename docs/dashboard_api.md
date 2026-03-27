@@ -48,12 +48,23 @@ All IDs come from the validator (no auto-increment on synced tables).
 | miner_id | BIGINT FK(miner) NOT NULL | |
 | hotkey | VARCHAR NOT NULL | |
 | recorded_at | TIMESTAMPTZ NOT NULL | scoring cycle timestamp |
-| skill_score | NUMERIC | final composite [0,1] |
+| skill_score | NUMERIC | final Cobb-Douglas composite [0,1] |
 | weight | NUMERIC | chain weight |
-| forecast_dim | NUMERIC | 0.6*FQ + 0.4*CAL |
-| skill_dim | NUMERIC | PSS_norm |
-| econ_dim | NUMERIC | 0.7*EDGE + 0.3*MES |
-| info_dim | NUMERIC | 0.6*SOS + 0.4*LEAD |
+| forecast_dim | NUMERIC | legacy: 0.6*FQ + 0.4*CAL |
+| skill_dim | NUMERIC | legacy: PSS_norm |
+| econ_dim | NUMERIC | legacy: 0.7*EDGE + 0.3*MES |
+| info_dim | NUMERIC | legacy: 0.6*SOS + 0.4*LEAD |
+| accuracy_dim | NUMERIC | CD pillar: forecast accuracy [0,1] |
+| edge_dim | NUMERIC | CD pillar: economic edge [0,1] |
+| timeliness_dim | NUMERIC | CD pillar: lead-lag + skill blend [0,1] |
+| uniqueness_dim | NUMERIC | CD pillar: submission originality [0,1] |
+| marginal_dim | NUMERIC | CD pillar: Shapley marginal contribution [0,1] |
+| sos_crowd | NUMERIC | anti-sybil: crowd-based SOS |
+| sos_cluster | NUMERIC | anti-sybil: cluster-based SOS |
+| sos_composite | NUMERIC | anti-sybil: blended SOS |
+| shapley_mean | NUMERIC | avg Shapley contribution value |
+| cluster_id | INT | sybil cluster assignment (NULL = independent) |
+| cluster_size | INT DEFAULT 1 | miners in assigned cluster |
 | fq_score | NUMERIC | forecast quality [0,1] |
 | cal_score | NUMERIC | calibration [0,1] |
 | sharp_score | NUMERIC | sharpness [0,1] |
@@ -61,7 +72,7 @@ All IDs come from the validator (no auto-increment on synced tables).
 | mes_score | NUMERIC | market efficiency [0,1] |
 | sos_score | NUMERIC | originality [0,1] |
 | lead_score | NUMERIC | lead ratio [0,1] |
-| brier_mean | NUMERIC | raw avg Brier |
+| brier_mean | NUMERIC | raw avg Brier (>0.30 = floor) |
 | pss_mean | NUMERIC | raw avg PSS |
 | es_adj | NUMERIC | risk-adjusted CLE |
 | es_mean | NUMERIC | raw CLE mean |
@@ -72,6 +83,12 @@ All IDs come from the validator (no auto-increment on synced tables).
 | n_eff | NUMERIC | effective sample size |
 
 Indexes: `(miner_id, recorded_at)`, `(hotkey, recorded_at)`, `(recorded_at)`, `(skill_score DESC)`
+
+> **v0.1.0 note:** `skill_score` is now computed via Cobb-Douglas multiplicative formula across
+> the 5 pillar dimensions (accuracy, edge, timeliness, uniqueness, marginal). The legacy
+> `forecast_dim`/`skill_dim`/`econ_dim`/`info_dim` columns are still populated for backward
+> compatibility but are no longer used in weight computation. Dashboard should transition to
+> displaying the 5 CD pillar dimensions.
 
 ### `submission_score` (append-only, access-controlled)
 

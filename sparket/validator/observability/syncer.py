@@ -175,10 +175,26 @@ class DataSyncer:
                 as_of=r["as_of"],
                 skill_score=_safe_float(r.get("skill_score")),
                 weight=None,  # filled from weight emission if available
+                # Legacy dimensions
                 forecast_dim=_safe_float(r.get("forecast_dim")),
                 skill_dim=_safe_float(r.get("skill_dim")),
                 econ_dim=_safe_float(r.get("econ_dim")),
                 info_dim=_safe_float(r.get("info_dim")),
+                # Cobb-Douglas 5-pillar dimensions
+                accuracy_dim=_safe_float(r.get("accuracy_dim")),
+                edge_dim=_safe_float(r.get("edge_dim")),
+                timeliness_dim=_safe_float(r.get("timeliness_dim")),
+                uniqueness_dim=_safe_float(r.get("uniqueness_dim")),
+                marginal_dim=_safe_float(r.get("marginal_dim")),
+                # Anti-sybil
+                sos_crowd=_safe_float(r.get("sos_crowd")),
+                sos_cluster=_safe_float(r.get("sos_cluster")),
+                sos_composite=_safe_float(r.get("sos_composite")),
+                # Shapley
+                shapley_mean=_safe_float(r.get("shapley_mean")),
+                cluster_id=int(r["cluster_id"]) if r.get("cluster_id") is not None else None,
+                cluster_size=int(r["cluster_size"]) if r.get("cluster_size") is not None else None,
+                # Sub-scores
                 fq_score=_safe_float(r.get("fq_score")),
                 cal_score=_safe_float(r.get("cal_score")),
                 sharp_score=_safe_float(r.get("sharp_score")),
@@ -186,6 +202,7 @@ class DataSyncer:
                 mes_score=_safe_float(r.get("mes_score")),
                 sos_score=_safe_float(r.get("sos_score")),
                 lead_score=_safe_float(r.get("lead_score")),
+                # Raw metrics
                 brier_mean=_safe_float(r.get("brier_mean")),
                 pss_mean=_safe_float(r.get("pss_mean")),
                 es_adj=_safe_float(r.get("es_adj")),

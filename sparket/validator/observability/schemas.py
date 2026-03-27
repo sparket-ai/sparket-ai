@@ -61,11 +61,28 @@ class MinerScoreRow(BaseModel):
     skill_score: Optional[float] = None
     weight: Optional[float] = None
 
-    # Dimension scores [0, 1]
+    # Legacy dimension scores [0, 1] (pre-Cobb-Douglas)
     forecast_dim: Optional[float] = None
     skill_dim: Optional[float] = None
     econ_dim: Optional[float] = None
     info_dim: Optional[float] = None
+
+    # Cobb-Douglas 5-pillar dimensions [0, 1]
+    accuracy_dim: Optional[float] = None
+    edge_dim: Optional[float] = None
+    timeliness_dim: Optional[float] = None
+    uniqueness_dim: Optional[float] = None
+    marginal_dim: Optional[float] = None
+
+    # Anti-sybil composite scores
+    sos_crowd: Optional[float] = None
+    sos_cluster: Optional[float] = None
+    sos_composite: Optional[float] = None
+
+    # Shapley contribution
+    shapley_mean: Optional[float] = None
+    cluster_id: Optional[int] = None
+    cluster_size: Optional[int] = None
 
     # Normalized sub-scores [0, 1]
     fq_score: Optional[float] = None
