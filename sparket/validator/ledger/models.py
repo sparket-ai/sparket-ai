@@ -119,6 +119,10 @@ class AccumulatorEntry(BaseModel):
     cal_score: float = 0.5
     sharp_score: float = 0.5
 
+    # Cobb-Douglas dimensions (populated by Shapley/composite uniqueness jobs)
+    uniqueness_dim: float | None = None
+    marginal_dim: float | None = None
+
     def derive_means(self) -> None:
         """Compute derived means from accumulator pairs.
 
@@ -248,6 +252,8 @@ class MinerMetrics(BaseModel):
             sos_score=acc.sos_score,
             lead_score=acc.lead_score,
             brier_mean=acc.brier_mean,
+            uniqueness_dim=acc.uniqueness_dim,
+            marginal_dim=acc.marginal_dim,
         )
 
 
