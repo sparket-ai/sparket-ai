@@ -89,12 +89,15 @@ The `compute_weights()` function is the critical shared code path used
 by both primary and auditor:
 
 1. Normalize metrics across miners (z-score logistic or percentile)
-2. Combine into 4 dimensions using config weights
-3. Compute final skill_score per miner
-4. L1 normalize
-5. Apply burn rate
-6. Apply max_weight_limit + min_allowed_weights
-7. Convert to uint16
+2. Combine into intermediate dimensions (ForecastDim, SkillDim, EconDim)
+3. Map to 5 Cobb-Douglas pillars (Accuracy, Edge, Timeliness, Uniqueness, Marginal)
+4. Clamp all pillars to [epsilon, 1.0]
+5. Compute multiplicative Cobb-Douglas SkillScore with configured exponents
+6. Apply hard accuracy floor (Brier > 0.30 → zero)
+7. L1 normalize
+8. Apply burn rate
+9. Apply max_weight_limit + min_allowed_weights
+10. Convert to uint16
 
 Identical inputs MUST produce identical outputs.
 
@@ -132,15 +135,19 @@ check, anti-cheat) plug in with zero changes to core code.
 
 ## Audit Depth (Honest Assessment)
 
-**Independently verifiable (~20% of score weight):**
+**Independently verifiable:**
 - Brier scores: recomputed from (miner probability, public outcome)
 - FQ/Brier accumulation: cross-checked against checkpoint
+- Hard accuracy floor: auditor can verify Brier > 0.30 → zero
 
-**Trusted from checkpoint (~80% of score weight):**
+**Trusted from checkpoint:**
 - CLV/CLE, SOS, lead-lag: derived from paid provider data
+- Uniqueness and Marginal dimensions: computed by Shapley jobs from
+  pairwise correlation and leave-one-out analysis
 
 **100% verifiable regardless:**
-- All normalization, dimension combining, and weight encoding math
+- All normalization, Cobb-Douglas multiplication, and weight encoding math
+- Pillar clamping, exponent application, and burn rate
 
 ## Security Model
 

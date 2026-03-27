@@ -115,17 +115,76 @@ on significant moves within a lead window.
 
 High SOS and high lead ratio reward independent, early signals.
 
-## SkillScore (final)
-SkillScore combines four dimensions, each normalized into a comparable
-0–1 range before weighting.
+## SkillScore (Cobb-Douglas 5-pillar model)
+SkillScore uses a multiplicative Cobb-Douglas formula across 5 pillar
+dimensions. Unlike an additive model, weakness in any single pillar
+significantly drags the total score — balanced miners are rewarded.
 
-Task mapping:
-- **Outcome accuracy**: ForecastDim (FQ_norm + CAL)
-- **Outcome relative skill**: SkillDim (PSS_norm)
-- **Odds origination edge**: EconDim (ES_norm + MES)
-- **Information advantage**: InfoDim (SOS + LEAD)
+### Intermediate dimensions
+Normalized metrics are first combined into intermediate dimensions:
 
-Component definitions:
+```
+ForecastDim = w_fq * FQ_norm + w_cal * CAL
+SkillDim    = PSS_norm
+EconDim     = w_edge * ES_norm + w_mes * MES
+```
+
+Default sub-dimension weights (from `sparket/validator/config/scoring_params.py`):
+- ForecastDim: `w_fq = 0.60`, `w_cal = 0.40`
+- EconDim: `w_edge = 0.70`, `w_mes = 0.30`
+
+### Cobb-Douglas pillar mapping
+The intermediate dimensions are mapped to 5 pillars:
+
+| Pillar | Derivation | What it measures |
+|--------|------------|------------------|
+| **Accuracy** | ForecastDim | Forecast quality + calibration |
+| **Edge** | EconDim | Economic edge vs closing line |
+| **Timeliness** | 0.5 * SkillDim + 0.5 * LEAD | Relative skill + early signal |
+| **Uniqueness** | Composite uniqueness (or SOS fallback) | Independence from the crowd |
+| **Marginal** | Shapley contribution (or 0.5 fallback) | Leave-one-out value added |
+
+All pillar values are clamped to [epsilon, 1.0] where epsilon = 0.01.
+
+**Uniqueness** is computed via pairwise correlation analysis, cluster
+detection, and sub-window overlap scoring. It penalizes miners that
+submit near-identical predictions to others (sybil rings, copy-trading
+clusters). During bootstrap (before Shapley jobs run), the simple SOS
+originality score `1 - |correlation|` is used as a fallback.
+
+**Marginal** is the miner's leave-one-out Shapley contribution to the
+crowd forecast. It answers: "how much would the crowd's accuracy drop if
+this miner were removed?" During bootstrap, a neutral default of 0.5 is
+used.
+
+### Final SkillScore
+```
+SkillScore = Accuracy^0.5 * Edge^1.0 * Timeliness^0.5 * Uniqueness^1.5 * Marginal^1.0
+```
+
+Default exponents:
+- `accuracy_exponent  = 0.5` — sub-linear: necessary but diminishing returns
+- `edge_exponent      = 1.0` — linear: core economic value signal
+- `timeliness_exponent = 0.5` — sub-linear: necessary but diminishing returns
+- `uniqueness_exponent = 1.5` — super-linear: strong anti-sybil incentive
+- `marginal_exponent  = 1.0` — linear: core crowd contribution signal
+
+The multiplicative structure means:
+- A miner scoring 0 on any pillar gets 0 total (after clamping to epsilon)
+- A miner who is strong on 4 pillars but weak on 1 scores much lower than
+  a balanced miner across all 5
+- The super-linear uniqueness exponent (1.5) means originality is the
+  single most impactful pillar
+
+### Hard accuracy floor
+```
+SkillScore = 0  if  brier_mean > 0.30
+```
+Miners with poor absolute accuracy are zeroed out regardless of their
+other pillar scores. This prevents fundamentally miscalibrated miners
+from earning weight through other dimensions.
+
+### Component definitions
 - **FQ_norm**: forecast quality from `FQ = 1 - 2 * brier_mean`, mapped to [0, 1].
 - **CAL**: calibration score from the logit regression fit.
 - **PSS_norm**: normalized, time-adjusted PSS vs market baseline.
@@ -134,72 +193,57 @@ Component definitions:
 - **SOS**: originality score `1 - |correlation|`.
 - **LEAD**: lead ratio (how often the miner moves first).
 
-Default dimension weights (from `sparket/validator/config/scoring_params.py`):
-- ForecastDim: `w_fq = 0.60`, `w_cal = 0.40`
-- EconDim: `w_edge = 0.70`, `w_mes = 0.30`
-- InfoDim: `w_sos = 0.60`, `w_lead = 0.40`
-
-Default SkillScore weights (targeting ~80/20 odds vs outcomes):
-- `w_outcome_accuracy = 0.10`
-- `w_outcome_relative = 0.10`
-- `w_odds_edge = 0.50`
-- `w_info_adv = 0.30`
-
-Metrics are normalized and combined into four dimensions:
-
-ForecastDim:
-```
-ForecastDim = w_fq * FQ_norm + w_cal * CAL
-```
-
-SkillDim:
-```
-SkillDim = PSS_norm
-```
-PSS is computed per submission (vs the market baseline) using both Brier
-and log‑loss PSS, blended into a single value, time‑adjusted, aggregated
-into `pss_mean`, then normalized to `PSS_norm`.
-
-EconDim:
-```
-EconDim = w_edge * ES_norm + w_mes * MES
-```
-
-InfoDim:
-```
-InfoDim = w_sos * SOS + w_lead * LEAD
-```
-
-Final SkillScore:
-```
-SkillScore = w_outcome_accuracy * ForecastDim
-           + w_outcome_relative * SkillDim
-           + w_odds_edge * EconDim
-           + w_info_adv * InfoDim
-```
-
-Normalization:
+### Normalization
 - FQ is mapped from [-1, 1] to [0, 1].
 - PSS and ES are normalized via z-score logistic when enough miners
   exist, otherwise percentile normalization is used.
 - CAL, MES, SOS, LEAD are clipped to [0, 1].
 
+### Weight encoding
+After SkillScore:
+1. L1 normalize across all miners
+2. Apply burn rate (default 90% to burn UID)
+3. Enforce `max_weight_limit` and `min_allowed_weights`
+4. Convert to uint16 for chain submission
+
 ## How to excel (game theoretic view)
-Dominant strategies are:
-- Be early with information that survives to close.
-- Be calibrated and sharp, not just extreme.
-- Avoid copy-trading near close; time bonus reduces late credit.
-- Maintain consistency to improve effective sample size and shrinkage.
-- Provide independent signals that lead the market, not mirror it.
+The multiplicative Cobb-Douglas structure changes optimal strategy
+compared to a linear additive model. You cannot compensate for a weak
+pillar by excelling at another — every dimension matters.
 
-If you only mirror the closing line, you get:
-- Low originality (SOS near 0)
-- Lower lead ratio
-- Less credit from time bonus
+Dominant strategies:
+- **Be balanced.** The multiplicative formula punishes any pillar near zero.
+  A miner with 0.8 across all 5 pillars far outscores one with 1.0 on
+  4 pillars and 0.2 on the fifth.
+- **Be original.** Uniqueness has the highest exponent (1.5), making it
+  the single most impactful dimension. Independent signals are rewarded
+  super-linearly.
+- **Be early.** Timeliness rewards early correct signals. Late
+  copy-trading reduces credit via the time bonus and hurts the lead
+  ratio component.
+- **Be calibrated.** Miners with Brier > 0.30 are hard-floored to zero
+  weight, regardless of other pillar scores.
+- **Add marginal value.** Submitting predictions that merely duplicate
+  what the crowd already knows earns low Shapley contribution. The
+  highest-value submissions are those that improve the crowd forecast
+  when added.
 
-If you are noisy or overconfident, you get:
-- Poor calibration (low CAL)
-- Bad Brier and PSS
+Losing strategies under Cobb-Douglas:
 
-The best response is to publish honest probabilities early, with
-evidence-backed deviations from the market.
+If you only mirror the closing line:
+- Low uniqueness (SOS near 0) → near-zero total score (exponent 1.5)
+- Low marginal contribution (Shapley near 0)
+- Less timeliness credit
+
+If you run sybil copies:
+- Cluster detection penalizes correlated submissions
+- All copies share a low uniqueness score
+- Marginal contribution near zero (redundant information)
+
+If you are noisy or overconfident:
+- Poor calibration → low accuracy pillar
+- If Brier > 0.30 → hard floor, zero weight entirely
+
+The best response is to publish honest, original probabilities early,
+with evidence-backed deviations from the market that improve crowd
+accuracy.
