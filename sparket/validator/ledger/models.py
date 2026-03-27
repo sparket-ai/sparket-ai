@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 # Schema version - bump on breaking changes to ledger format
 # ---------------------------------------------------------------------------
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
