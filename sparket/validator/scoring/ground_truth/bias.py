@@ -188,11 +188,11 @@ class BiasEstimator:
             # bias_factor = p_true / p_book, so if book overestimates, factor < 1
             if obs.book_prob > Decimal("0"):
                 implied_adjustment = Decimal(str(obs.outcome_hit)) / obs.book_prob
-                # Clamp adjustment to reasonable range
-                implied_adjustment = max(
-                    Decimal("0.5"),
-                    min(implied_adjustment, Decimal("2.0")),
-                )
+                # Clamp upper bound only — the lower bound must stay at 0
+                # to preserve unbiasedness.  Clamping the floor to 0.5
+                # introduced systematic upward drift in bias_factor for
+                # probabilities near 0.5 (e.g. totals markets).
+                implied_adjustment = min(implied_adjustment, Decimal("2.0"))
                 bias = (Decimal("1") - alpha) * bias + alpha * implied_adjustment
 
             sample_count += 1

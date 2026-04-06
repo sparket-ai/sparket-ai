@@ -41,6 +41,8 @@ def make_submission(
     pss_log: float = None,
     minutes_to_close: int = 1440,  # Default 1 day
     brier: float = None,
+    miner_odds: float = 2.0,
+    close_odds: float = 2.0,
 ):
     """Create a mock submission row."""
     if submitted_at is None:
@@ -54,6 +56,8 @@ def make_submission(
         "pss_log": pss_log,
         "minutes_to_close": minutes_to_close,
         "brier": brier,
+        "miner_odds": miner_odds,
+        "close_odds": close_odds,
     }
 
 
@@ -258,6 +262,77 @@ class TestComputeMinerMetrics:
         )
 
         assert metrics is None
+
+
+class TestOddsRatioGating:
+    """Tests for CLE odds-ratio gating in _compute_miner_metrics."""
+
+    async def test_extreme_odds_excluded_from_cle(self, mock_db, mock_logger):
+        """Submissions with miner_odds/close_odds > 2.0 should be excluded from ES."""
+        now = datetime.now(timezone.utc)
+
+        mock_db.read = AsyncMock(
+            return_value=[
+                # Reasonable: odds ratio 2.1/2.0 = 1.05 → included
+                make_submission(1, now - timedelta(days=1), cle=0.05, miner_odds=2.1, close_odds=2.0),
+                # Extreme: odds ratio 5.3/1.9 = 2.79 → excluded
+                make_submission(2, now - timedelta(days=1), cle=1.0, miner_odds=5.3, close_odds=1.9),
+                # Extreme: odds ratio 4.1/2.0 = 2.05 → excluded
+                make_submission(3, now - timedelta(days=1), cle=0.9, miner_odds=4.1, close_odds=2.0),
+            ]
+        )
+
+        job = RollingAggregatesJob(mock_db, mock_logger)
+        metrics = await job._compute_miner_metrics(
+            miner_id=1, miner_hotkey="test",
+            window_start=now - timedelta(days=30), window_end=now,
+        )
+
+        assert metrics is not None
+        # Only the first submission's CLE (0.05) should contribute
+        assert metrics["es_mean"] == pytest.approx(0.05, abs=0.01)
+
+    async def test_reasonable_odds_included(self, mock_db, mock_logger):
+        """Submissions with odds ratio within threshold should all contribute."""
+        now = datetime.now(timezone.utc)
+
+        mock_db.read = AsyncMock(
+            return_value=[
+                make_submission(1, now - timedelta(days=1), cle=0.05, miner_odds=2.1, close_odds=2.0),
+                make_submission(2, now - timedelta(days=2), cle=0.03, miner_odds=1.95, close_odds=2.0),
+                make_submission(3, now - timedelta(days=3), cle=-0.02, miner_odds=1.85, close_odds=2.0),
+            ]
+        )
+
+        job = RollingAggregatesJob(mock_db, mock_logger)
+        metrics = await job._compute_miner_metrics(
+            miner_id=1, miner_hotkey="test",
+            window_start=now - timedelta(days=30), window_end=now,
+        )
+
+        assert metrics is not None
+        # All three should contribute — es_mean should reflect their weighted average
+        assert metrics["es_mean"] > -0.1
+        assert metrics["es_mean"] < 0.1
+
+    async def test_missing_odds_excludes_cle(self, mock_db, mock_logger):
+        """Submissions without odds data should not contribute to CLE."""
+        now = datetime.now(timezone.utc)
+
+        mock_db.read = AsyncMock(
+            return_value=[
+                make_submission(1, now - timedelta(days=1), cle=0.05, miner_odds=None, close_odds=None),
+            ]
+        )
+
+        job = RollingAggregatesJob(mock_db, mock_logger)
+        metrics = await job._compute_miner_metrics(
+            miner_id=1, miner_hotkey="test",
+            window_start=now - timedelta(days=30), window_end=now,
+        )
+
+        assert metrics is not None
+        assert metrics["es_mean"] == 0.0  # No eligible CLE values
 
 
 class TestApplyShrinkage:

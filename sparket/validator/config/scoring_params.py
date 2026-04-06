@@ -292,6 +292,17 @@ class GroundTruthParams(BaseModel):
         le=24,
         description="Max hours between submission and snapshot for valid match.",
     )
+    max_odds_ratio_for_cle: Decimal = Field(
+        default=Decimal("2.0"),
+        ge=Decimal("1.2"),
+        le=Decimal("10.0"),
+        description=(
+            "Maximum allowed ratio of miner_odds / close_odds for a submission "
+            "to contribute to CLE aggregation. Submissions with odds diverging "
+            "more than this factor from the closing line are excluded from "
+            "economic edge (ES) metrics. Does not affect Brier/outcome scoring."
+        ),
+    )
 
 
 class NormalizationParams(BaseModel):

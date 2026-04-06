@@ -172,6 +172,52 @@ class TestBiasEstimator:
         assert result1[key2].bias_factor == result2[key2].bias_factor
 
 
+class TestBiasUnbiasedness:
+    """Tests that the bias estimator converges to 1.0 for calibrated books."""
+
+    @pytest.fixture
+    def estimator(self):
+        return BiasEstimator()
+
+    def test_converges_for_fair_coin(self, estimator):
+        """Bias should converge to ~1.0 for a perfectly calibrated 50% book."""
+        import random
+        random.seed(42)
+
+        key = make_bias_key(1, 1, "total")
+        state = BiasState(1, 1, "total", Decimal("1.0"), Decimal("0.01"), Decimal("0"), 0, 1)
+
+        for _ in range(2000):
+            hit = 1 if random.random() < 0.5 else 0
+            obs = BiasUpdateInput(1, 1, "total", Decimal("0.5"), hit)
+            updates = estimator.compute_batch_updates([obs], {key: state})
+            state = updates[key]
+
+        # Should converge to 1.0 ± 0.1 for an unbiased book
+        assert abs(float(state.bias_factor) - 1.0) < 0.1, (
+            f"Bias factor drifted to {state.bias_factor} for a fair 50% book "
+            f"(expected ~1.0). This indicates the EMA update is biased."
+        )
+
+    def test_converges_for_60pct_book(self, estimator):
+        """Bias should converge to ~1.0 for a calibrated 60% book."""
+        import random
+        random.seed(123)
+
+        key = make_bias_key(1, 1, "ml")
+        state = BiasState(1, 1, "ml", Decimal("1.0"), Decimal("0.01"), Decimal("0"), 0, 1)
+
+        for _ in range(2000):
+            hit = 1 if random.random() < 0.6 else 0
+            obs = BiasUpdateInput(1, 1, "ml", Decimal("0.6"), hit)
+            updates = estimator.compute_batch_updates([obs], {key: state})
+            state = updates[key]
+
+        assert abs(float(state.bias_factor) - 1.0) < 0.1, (
+            f"Bias factor drifted to {state.bias_factor} for a calibrated 60% book"
+        )
+
+
 class TestIsBiasTrusted:
     """Tests for is_bias_trusted method."""
 
