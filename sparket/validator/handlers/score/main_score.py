@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import bittensor as bt
 
+from sparket.validator.scoring.jobs.bias_update import BiasUpdateJob
 from sparket.validator.scoring.jobs.rolling_aggregates import RollingAggregatesJob
 from sparket.validator.scoring.jobs.calibration_sharpness import CalibrationSharpnessJob
 from sparket.validator.scoring.jobs.originality_lead_lag import OriginalityLeadLagJob
@@ -114,6 +115,20 @@ class MainScoreHandler:
             except Exception as e:
                 bt.logging.warning({"main_score_batch_error": str(e)})
                 results["errors"].append(f"batch_scoring: {e}")
+
+            # Phase 1.75: Update sportsbook bias from settled outcomes
+            # Runs after outcome scoring so new settlements are included,
+            # and before rolling aggregates so future consensus snapshots
+            # benefit from corrected bias factors.
+            try:
+                bias_job = BiasUpdateJob(self.database, self._logger)
+                await bias_job.run()
+                results["bias_updated"] = True
+                bt.logging.info({"main_score_bias": "completed"})
+            except Exception as e:
+                results["bias_updated"] = False
+                bt.logging.warning({"main_score_bias_error": str(e)})
+                results["errors"].append(f"bias_update: {e}")
 
             # Phase 2: Run scoring jobs in dependency order
             job_classes = [

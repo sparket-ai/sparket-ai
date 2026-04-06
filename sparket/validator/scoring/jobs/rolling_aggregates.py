@@ -57,7 +57,9 @@ _SELECT_MINER_SUBMISSIONS = text(
         svc.minutes_to_close,
         sos.pss_brier,
         sos.pss_log,
-        sos.brier
+        sos.brier,
+        ms.odds_eu AS miner_odds,
+        svc.close_odds_eu AS close_odds
     FROM miner_submission ms
     LEFT JOIN submission_vs_close svc ON ms.submission_id = svc.submission_id
     LEFT JOIN submission_outcome_score sos ON ms.submission_id = sos.submission_id
@@ -249,6 +251,11 @@ class RollingAggregatesJob(ScoringJob):
         half_life = self.params.decay.half_life_days
         decay_weights = compute_decay_weights(timestamps, ref_ts, half_life)
 
+        # Odds-ratio threshold: exclude extreme CLE values from ES aggregation.
+        # Submissions with miner_odds / close_odds > threshold are noise,
+        # not genuine edge claims.
+        max_odds_ratio = float(self.params.ground_truth.max_odds_ratio_for_cle)
+
         # Extract metrics (handle None values)
         cle_values = []
         cle_weights = []
@@ -263,13 +270,29 @@ class RollingAggregatesJob(ScoringJob):
         for i, s in enumerate(submissions):
             w = decay_weights[i]
 
+            # Odds-ratio gate: exclude extreme divergence from economic edge
+            # metrics (CLE and CLV). Submissions where miner odds are within
+            # max_odds_ratio of closing odds are eligible.
+            odds_eligible = True
+            if s.get("miner_odds") and s.get("close_odds"):
+                miner_odds = float(s["miner_odds"])
+                close_odds = float(s["close_odds"])
+                if close_odds > 0:
+                    ratio = miner_odds / close_odds
+                    odds_eligible = (1.0 / max_odds_ratio) <= ratio <= max_odds_ratio
+                else:
+                    odds_eligible = False
+            elif s["cle"] is not None or s.get("clv_prob") is not None:
+                # Have CLE/CLV but no odds data to check — exclude to be safe
+                odds_eligible = False
+
             # CLE - raw, no time adjustment
-            if s["cle"] is not None:
+            if odds_eligible and s["cle"] is not None:
                 cle_values.append(float(s["cle"]))
                 cle_weights.append(w)
 
-            # CLV - raw, no time adjustment
-            if s["clv_prob"] is not None:
+            # CLV uses the same gate — it measures the same divergence
+            if odds_eligible and s["clv_prob"] is not None:
                 clv_prob_values.append(float(s["clv_prob"]))
                 clv_prob_weights.append(w)
 
