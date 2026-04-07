@@ -14,6 +14,7 @@ from sparket.validator.scoring.jobs.bias_update import BiasUpdateJob
 from sparket.validator.scoring.jobs.rolling_aggregates import RollingAggregatesJob
 from sparket.validator.scoring.jobs.calibration_sharpness import CalibrationSharpnessJob
 from sparket.validator.scoring.jobs.originality_lead_lag import OriginalityLeadLagJob
+from sparket.validator.scoring.jobs.composite_uniqueness import CompositeUniquenessJob
 from sparket.validator.scoring.jobs.skill_score import SkillScoreJob
 from sparket.validator.scoring.ground_truth.snapshot_pipeline import SnapshotPipeline
 from sparket.validator.handlers.score.odds_score import OddsScoreHandler
@@ -135,6 +136,7 @@ class MainScoreHandler:
                 RollingAggregatesJob,
                 CalibrationSharpnessJob,
                 OriginalityLeadLagJob,
+                CompositeUniquenessJob,
                 SkillScoreJob,  # terminal job — depends on all upstream jobs
             ]
 
