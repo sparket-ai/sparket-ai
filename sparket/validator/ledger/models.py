@@ -126,9 +126,15 @@ class AccumulatorEntry(BaseModel):
     def derive_means(self) -> None:
         """Compute derived means from accumulator pairs.
 
-        Uses the same fallback defaults as SkillScoreJob._to_float_safe().
+        Defaults must match SkillScoreJob._to_float_safe() and
+        MinerMetrics field defaults so that miners with no data
+        are treated identically by primary and auditor code paths.
+
+        CRITICAL: brier default must be 0.5 (not 0.0) so miners with
+        no outcome data are treated as "unknown accuracy" and hit the
+        Brier floor, not as "perfect accuracy" and pass it.
         """
-        self.brier_mean = self.brier.ws / self.brier.wt if self.brier.wt else 0.0
+        self.brier_mean = self.brier.ws / self.brier.wt if self.brier.wt else 0.5
         self.fq_raw = self.fq.ws / self.fq.wt if self.fq.wt else 0.0
         self.pss_mean = self.pss.ws / self.pss.wt if self.pss.wt else 0.0
         self.es_adj = self.es.ws / self.es.wt if self.es.wt else 0.0

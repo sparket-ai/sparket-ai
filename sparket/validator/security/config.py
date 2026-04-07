@@ -109,14 +109,18 @@ class RateLimitConfig:
 @dataclass
 class SecurityConfig:
     """Combined security configuration."""
-    
+
     cooldown: CooldownConfig = field(default_factory=CooldownConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
-    
+
     # Feature flags
     enforce_registration: bool = True  # Reject unregistered hotkeys
     enforce_cooldowns: bool = True  # Apply cooldowns on failures
     enforce_blacklist: bool = True  # Check permanent blacklist
+
+    # Protected hotkeys that can NEVER be banned (validators, auditors).
+    # These hotkeys bypass blacklist checks and cannot be added to any ban list.
+    protected_hotkeys: set[str] = field(default_factory=set)
 
 
 __all__ = [

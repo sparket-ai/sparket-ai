@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import bittensor as bt
 from sqlalchemy import text
@@ -157,16 +157,32 @@ class OddsScoreHandler:
             return 0
 
         scored = 0
+        skipped = 0
+        reason_counts: Dict[str, int] = {}
+
         for row in rows:
             try:
-                success = await self._score_submission_row(row)
+                success, skip_reason = await self._score_submission_row(row)
                 if success:
                     scored += 1
+                else:
+                    skipped += 1
+                    if skip_reason:
+                        reason_counts[skip_reason] = reason_counts.get(skip_reason, 0) + 1
             except Exception as e:
+                skipped += 1
+                reason_counts["error"] = reason_counts.get("error", 0) + 1
                 bt.logging.warning({
                     "score_batch_error": str(e),
                     "submission_id": row.get("submission_id"),
                 })
+
+        bt.logging.info({
+            "score_batch_summary": "odds",
+            "scored": scored,
+            "skipped": skipped,
+            "reason_counts": reason_counts,
+        })
 
         return scored
 
@@ -223,14 +239,16 @@ class OddsScoreHandler:
         except (ValidationError, KeyError):
             return False
 
-    async def _score_submission_row(self, row: Dict[str, Any]) -> bool:
+    async def _score_submission_row(
+        self, row: Dict[str, Any],
+    ) -> Tuple[bool, Optional[str]]:
         """Score a submission from database row.
 
         Args:
             row: Database row dict
 
         Returns:
-            True if scored and persisted successfully
+            Tuple of (success, skip reason if skipped)
         """
         submission_id = row["submission_id"]
         market_id = row["market_id"]
@@ -243,9 +261,9 @@ class OddsScoreHandler:
         # Look up ground truth
         gt = await self._get_ground_truth(market_id, side)
         if gt is None:
-            return False
+            return False, "no_gt"
         if gt["contributing_books"] < self._min_books_for_consensus:
-            return False
+            return False, "insufficient_books"
 
         try:
             miner_odds = float(to_decimal(row["odds_eu"], "odds_eu"))
@@ -262,7 +280,7 @@ class OddsScoreHandler:
             )
 
             if clv_result is None:
-                return False
+                return False, "clv_failed"
 
             # Persist to submission_vs_close
             await self.database.write(
@@ -283,11 +301,11 @@ class OddsScoreHandler:
                 },
             )
 
-            return True
+            return True, None
 
         except (ValidationError, KeyError) as e:
             bt.logging.debug({"score_submission_error": str(e), "submission_id": submission_id})
-            return False
+            return False, "validation_error"
 
     async def _get_ground_truth(
         self,

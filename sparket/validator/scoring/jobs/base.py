@@ -107,9 +107,9 @@ class ScoringJob(ABC):
                     """
                     INSERT INTO scoring_job_state (
                         job_id, status, last_checkpoint, checkpoint_data,
-                        items_processed, items_total, started_at
+                        items_processed, items_total, started_at, error_count
                     ) VALUES (
-                        :job_id, 'running', :ts, :data, :processed, :total, :started
+                        :job_id, 'running', :ts, :data, :processed, :total, :started, 0
                     )
                     ON CONFLICT (job_id) DO UPDATE SET
                         last_checkpoint = :ts,

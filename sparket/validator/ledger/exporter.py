@@ -184,6 +184,36 @@ class LedgerExporter:
         window_days = self.params.windows.rolling_window_days
         if as_of is None:
             _, as_of = get_canonical_window_bounds(window_days)
+
+        # If today's data has no skill scores yet, fall back to the most
+        # recent date that does.  This keeps the checkpoint consistent with
+        # the weights being set on chain (which use the same fallback).
+        from sqlalchemy import text as _text
+        _check = await self.database.read(
+            _text("""
+                SELECT 1 FROM miner_rolling_score
+                WHERE as_of = :as_of AND window_days = :wd
+                  AND skill_score IS NOT NULL AND skill_score > 0
+                LIMIT 1
+            """),
+            params={"as_of": as_of, "wd": window_days},
+            mappings=True,
+        )
+        if not _check:
+            _fallback = await self.database.read(
+                _text("""
+                    SELECT DISTINCT as_of FROM miner_rolling_score
+                    WHERE window_days = :wd
+                      AND skill_score IS NOT NULL AND skill_score > 0
+                    ORDER BY as_of DESC LIMIT 1
+                """),
+                params={"wd": window_days},
+                mappings=True,
+            )
+            if _fallback:
+                as_of = _fallback[0]["as_of"]
+                bt.logging.info({"checkpoint_fallback_as_of": str(as_of)})
+
         window_start = as_of
 
         epoch = await self._get_epoch()
@@ -217,9 +247,13 @@ class LedgerExporter:
                 hotkey=row["hotkey"],
                 uid=row["uid"],
                 n_submissions=int(row.get("n_submissions") or 0),
+                # For miners with no outcome data (brier_wt=0), encode the
+                # default as ws=0.5, wt=1.0 so that derive_means() on both
+                # old and new auditor code computes 0.5 (hits the Brier floor)
+                # instead of 0.0 (incorrectly passes it).
                 brier=MetricAccumulator(
-                    ws=_safe_float(row.get("brier_ws")),
-                    wt=_safe_float(row.get("brier_wt")),
+                    ws=_safe_float(row.get("brier_ws")) if _safe_float(row.get("brier_wt")) else 0.5,
+                    wt=_safe_float(row.get("brier_wt")) if _safe_float(row.get("brier_wt")) else 1.0,
                 ),
                 fq=MetricAccumulator(
                     ws=_safe_float(row.get("fq_ws")),

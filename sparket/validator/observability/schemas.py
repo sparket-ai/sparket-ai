@@ -182,6 +182,8 @@ class EventSync(BaseModel):
     venue: Optional[str] = None
     start_time_utc: datetime
     status: str
+    final_at: Optional[datetime] = None
+    n_submissions: int = 0
 
 
 class MarketSync(BaseModel):
@@ -211,6 +213,97 @@ class EventsSyncPayload(BaseModel):
     events: list[EventSync]
     markets: list[MarketSync]
     outcomes: list[OutcomeSync]
+
+
+# ---------------------------------------------------------------------------
+# Consensus Timeline (POST /api/v1/admin/sync/consensus)
+# ---------------------------------------------------------------------------
+
+
+class ConsensusRow(BaseModel):
+    """Flat per-event consensus snapshot for the dashboard."""
+
+    event_id: str
+    timestamp: datetime
+    moneyline_home: float
+    moneyline_away: float
+    spread_home: float
+    total: float
+
+
+class ConsensusSyncPayload(BaseModel):
+    """Consensus timeline snapshots, sent every scoring cycle."""
+
+    validator_hotkey: str
+    timestamp: datetime
+    payload: list[ConsensusRow]
+
+
+# ---------------------------------------------------------------------------
+# Pricing Feed (POST /api/v1/admin/sync/pricing)
+# ---------------------------------------------------------------------------
+
+
+class SubnetPerformanceRow(BaseModel):
+    """Aggregate performance for one sport + market type combination."""
+
+    sport_code: str
+    market_kind: str
+    n_scored: int = 0
+    avg_cle: Optional[float] = None
+    median_cle: Optional[float] = None
+    avg_brier: Optional[float] = None
+    avg_pss: Optional[float] = None
+    top10_avg_cle: Optional[float] = None
+    top10_median_cle: Optional[float] = None
+    top10_avg_brier: Optional[float] = None
+    top10_n_scored: int = 0
+
+
+class SubnetPerformanceSyncPayload(BaseModel):
+    """Aggregate subnet performance stats, sent every scoring cycle."""
+
+    validator_hotkey: str
+    timestamp: datetime
+    total_scored: int = 0
+    total_events: int = 0
+    active_miners: int = 0
+    rows: list[SubnetPerformanceRow]
+
+
+class PricingConsensusRow(BaseModel):
+    """Current consensus probability for one market/side."""
+
+    market_id: int
+    event_id: int
+    kind: str  # MONEYLINE, SPREAD, TOTAL
+    line: Optional[float] = None  # spread/total line
+    side: str  # HOME, AWAY, OVER, UNDER
+    prob_consensus: float
+    odds_consensus: float
+    contributing_books: int
+    std_dev: Optional[float] = None
+    snapshot_ts: datetime
+
+
+class PricingBookQuote(BaseModel):
+    """Individual sportsbook quote for one market/side."""
+
+    market_id: int
+    sportsbook: str
+    side: str
+    odds_eu: float
+    imp_prob: float
+    fetched_at: datetime
+
+
+class PricingSyncPayload(BaseModel):
+    """Full pricing snapshot for active markets. Sent every scoring cycle."""
+
+    validator_hotkey: str
+    timestamp: datetime
+    consensus: list[PricingConsensusRow]
+    book_quotes: list[PricingBookQuote]
 
 
 # ---------------------------------------------------------------------------

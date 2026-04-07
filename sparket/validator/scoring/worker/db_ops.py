@@ -101,8 +101,8 @@ async def record_job_failure(db: Any, worker_id: str, job_id: str, error: str) -
     await db.write(
         text(
             """
-            INSERT INTO scoring_job_state (job_id, status, last_error, error_count, checkpoint_data)
-            VALUES (:job_id, 'failed', :error, 1, '{}')
+            INSERT INTO scoring_job_state (job_id, status, last_error, error_count, checkpoint_data, items_processed)
+            VALUES (:job_id, 'failed', :error, 1, '{}', 0)
             ON CONFLICT (job_id) DO UPDATE SET
                 status = 'failed',
                 last_error = :error,

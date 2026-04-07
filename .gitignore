@@ -187,6 +187,17 @@ sparket/data/auditor/
 docs/SPARKET_WARBOOK.md
 docs/burn_scaling_strategy.md
 docs/comms_strategy.md
+docs/spec_*.md
 
 # Ad-hoc diagnostic scripts
 scripts/dev/diagnose_*
+
+# Spec-kit (cloned toolkit, not project code)
+spec-kit/
+
+# Specify infrastructure (internal verification, not public)
+.specify/
+specs/
+
+# Nightly run logs
+specs/nightly/runs/*.log

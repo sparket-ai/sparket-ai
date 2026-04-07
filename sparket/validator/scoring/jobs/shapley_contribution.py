@@ -32,13 +32,14 @@ from .base import ScoringJob
 
 _SELECT_RECENTLY_SETTLED = text(
     """
-    SELECT DISTINCT sos.market_id, sos.settled_at
+    SELECT DISTINCT ms.market_id, sos.settled_at
     FROM submission_outcome_score sos
+    JOIN miner_submission ms ON ms.submission_id = sos.submission_id
     WHERE sos.settled_at > :since
       AND sos.settled_at <= :until
       AND NOT EXISTS (
           SELECT 1 FROM shapley_contribution sc
-          WHERE sc.market_id = sos.market_id
+          WHERE sc.market_id = ms.market_id
       )
     ORDER BY sos.settled_at
     """

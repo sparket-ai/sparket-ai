@@ -25,9 +25,10 @@ def resolve_loop_timeouts(step_target_seconds: int) -> dict[str, int]:
         base = max(5, int(step_target_seconds))
         return {
             "forward": base,
-            "scoring": base * 2,
-            "provider": base * 2,
-        "outcome": base * 2,
-            "cleanup": base * 2,
-        "worker_heartbeat": base,
+            "scoring": max(300, base * 2),
+            "provider": max(120, base * 2),
+            "outcome": max(120, base * 2),
+            "cleanup": max(60, base * 2),
+            "worker_heartbeat": max(10, base),
+            "ledger_export": max(60, base),
         }
