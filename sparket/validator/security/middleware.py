@@ -144,22 +144,16 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             raise
     
     def _get_client_ip(self, request: Request) -> Optional[str]:
-        """Extract client IP, handling reverse proxies."""
-        # Check X-Forwarded-For header (set by proxies)
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            # Take the first IP in the chain (original client)
-            return forwarded.split(",")[0].strip()
-        
-        # Check X-Real-IP header (nginx)
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
-        
-        # Fall back to direct connection
+        """Extract client IP from the TCP connection.
+
+        Only uses the actual socket peer address (request.client.host).
+        X-Forwarded-For / X-Real-IP headers are NOT trusted because there
+        is no reverse proxy in front of this service -- an attacker could
+        spoof those headers to trick the rate limiter into blocking
+        arbitrary IPs (including 127.0.0.1, which kills DNS/loopback).
+        """
         if request.client:
             return request.client.host
-        
         return None
     
     def _is_scanner_request(

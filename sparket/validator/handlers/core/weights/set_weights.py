@@ -81,6 +81,32 @@ class SetWeightsHandler:
                 mappings=True,
             )
 
+            # If no scores for today, fall back to most recent date with scores
+            if not rows or all(r["skill_score"] is None or r["skill_score"] == 0 for r in rows):
+                from sqlalchemy import text as _text
+                fallback_rows = await self.database.read(
+                    _text("""
+                        SELECT DISTINCT as_of FROM miner_rolling_score
+                        WHERE window_days = :window_days
+                          AND skill_score IS NOT NULL AND skill_score > 0
+                        ORDER BY as_of DESC LIMIT 1
+                    """),
+                    params={"window_days": window_days},
+                    mappings=True,
+                )
+                if fallback_rows:
+                    fallback_as_of = fallback_rows[0]["as_of"]
+                    bt.logging.info({"load_scores_fallback": {"from": str(as_of), "to": str(fallback_as_of)}})
+                    rows = await self.database.read(
+                        _SELECT_SKILL_SCORES,
+                        params={
+                            "netuid": netuid,
+                            "as_of": fallback_as_of,
+                            "window_days": window_days,
+                        },
+                        mappings=True,
+                    )
+
             # Initialize scores array with zeros
             scores = np.zeros(n_neurons, dtype=np.float32)
 
@@ -103,7 +129,7 @@ class SetWeightsHandler:
             return scores
 
         except Exception as e:
-            bt.logging.warning({"load_scores_error": str(e)})
+            bt.logging.warning({"load_scores_error": repr(e)})
             return np.zeros(n_neurons, dtype=np.float32)
 
     def set_weights(self, validator: Any) -> None:

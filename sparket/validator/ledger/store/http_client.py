@@ -113,10 +113,11 @@ class HTTPLedgerStore:
     async def list_deltas(
         self, epoch: int, since: datetime | None = None,
     ) -> list[str]:
-        params = f"?epoch={epoch}"
+        from urllib.parse import urlencode
+        qs: dict[str, str] = {"epoch": str(epoch)}
         if since:
-            params += f"&since={since.isoformat()}"
-        resp = await self._get(f"/ledger/deltas{params}")
+            qs["since"] = since.isoformat()
+        resp = await self._get(f"/ledger/deltas?{urlencode(qs)}")
         resp.raise_for_status()
         return resp.json().get("deltas", [])
 

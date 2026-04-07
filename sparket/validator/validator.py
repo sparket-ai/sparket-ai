@@ -316,8 +316,11 @@ class BaseValidatorNeuron(BaseNeuron):
             # Initialize SecurityManager for rate limiting and blacklisting
             bt.logging.info({"validator_init": {"step": "initializing_security_manager"}})
             try:
-                from sparket.validator.security import SecurityManager
-                self.security_manager = SecurityManager(database=self.dbm)
+                from sparket.validator.security import SecurityManager, SecurityConfig
+                # Protect validator's own hotkey from ever being banned
+                own_hotkey = getattr(getattr(self.wallet, "hotkey", None), "ss58_address", None)
+                sec_config = SecurityConfig(protected_hotkeys={own_hotkey} if own_hotkey else set())
+                self.security_manager = SecurityManager(database=self.dbm, config=sec_config)
                 # Load permanent blacklist from database
                 self.loop.run_until_complete(self.security_manager.load_blacklist_from_db())
                 # Initialize with current metagraph hotkeys
@@ -854,6 +857,7 @@ class BaseValidatorNeuron(BaseNeuron):
                                                 step=self.step,
                                                 app_config=self.app_config,
                                                 handlers=self.handlers,
+                                                validator=self,
                                             ),
                                             timeout=timeouts["scoring"],
                                         )

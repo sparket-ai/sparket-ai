@@ -82,7 +82,11 @@ _SELECT_SETTLED_MARKETS = text(
       AND o.settled_at IS NOT NULL
       AND scored.scored_market_id IS NULL
       AND o.settled_at >= :since
-    ORDER BY o.settled_at
+      AND EXISTS (
+          SELECT 1 FROM ground_truth_closing gtc
+          WHERE gtc.market_id = o.market_id
+      )
+    ORDER BY o.settled_at DESC
     LIMIT :limit
     """
 )
@@ -186,7 +190,7 @@ class OutcomeScoreHandler:
     async def score_batch(
         self,
         since: datetime,
-        limit: int = 100,
+        limit: int = 10_000,
     ) -> int:
         """Score submissions for a batch of settled markets.
 
@@ -210,27 +214,43 @@ class OutcomeScoreHandler:
             return 0
 
         total_scored = 0
+        skipped = 0
+        reason_counts: Dict[str, int] = {}
 
         for market_row in settled:
             try:
-                scored = await self._score_market_submissions(market_row)
+                scored, skip_reason = await self._score_market_submissions(market_row)
                 total_scored += scored
+                if scored == 0 and skip_reason:
+                    skipped += 1
+                    reason_counts[skip_reason] = reason_counts.get(skip_reason, 0) + 1
             except Exception as e:
+                skipped += 1
+                reason_counts["error"] = reason_counts.get("error", 0) + 1
                 bt.logging.warning({
                     "score_market_error": str(e),
                     "market_id": market_row.get("market_id"),
                 })
 
+        bt.logging.info({
+            "score_batch_summary": "outcome",
+            "scored": total_scored,
+            "skipped": skipped,
+            "reason_counts": reason_counts,
+        })
+
         return total_scored
 
-    async def _score_market_submissions(self, market_row: Dict[str, Any]) -> int:
+    async def _score_market_submissions(
+        self, market_row: Dict[str, Any],
+    ) -> Tuple[int, Optional[str]]:
         """Score all submissions for a single market.
 
         Args:
             market_row: Market outcome row from database
 
         Returns:
-            Number of submissions scored
+            Tuple of (submissions scored, skip reason if skipped)
         """
         market_id = market_row["market_id"]
         raw_result = market_row.get("result")
@@ -238,10 +258,10 @@ class OutcomeScoreHandler:
         kind = market_row["kind"]
 
         if raw_result is None:
-            return 0
+            return 0, "no_result"
         result = str(raw_result).strip().lower()
         if not result:
-            return 0
+            return 0, "no_result"
 
         # Get sides for this market kind
         sides = get_sides_for_kind(kind)
@@ -250,31 +270,36 @@ class OutcomeScoreHandler:
         # For moneyline with draw, we might have only home/away submissions
         if result == "draw" and "draw" not in sides:
             # Can't score if draw wasn't a valid outcome
-            return 0
+            return 0, "invalid_draw"
 
         # Get ground truth probabilities
         gt_probs, min_books = await self._get_ground_truth_probs(market_id)
         if not gt_probs:
-            return 0
+            return 0, "no_gt"
         if min_books is None or min_books < self._min_books_for_consensus:
-            return 0
+            return 0, "insufficient_books"
+
+        # Filter GT to only sides valid for this market kind (fixes
+        # ground_truth_closing contamination where all 5 sides are stored
+        # regardless of market kind).
+        gt_probs = {s: p for s, p in gt_probs.items() if s in sides}
 
         # Filter to sides we have ground truth for
         valid_sides = [s for s in sides if s in gt_probs]
         if len(valid_sides) < 2:
-            return 0
+            return 0, "insufficient_sides"
 
         # Build outcome vector
         try:
             outcome_vec = outcome_to_vector(result, valid_sides)
         except ValidationError:
-            return 0
+            return 0, "invalid_outcome"
 
         # Build ground truth probability vector
         try:
             truth_probs = probs_for_market(gt_probs, valid_sides)
         except ValidationError:
-            return 0
+            return 0, "invalid_gt_probs"
 
         # Get all submissions for this market
         submissions = await self.database.read(
@@ -284,7 +309,7 @@ class OutcomeScoreHandler:
         )
 
         if not submissions:
-            return 0
+            return 0, "no_submissions"
 
         # Group submissions by logical submission key (miner + market + time)
         grouped = self._group_submissions_by_key(submissions)
@@ -308,7 +333,7 @@ class OutcomeScoreHandler:
                     "submission_key": submission_key,
                 })
 
-        return scored
+        return scored, None
 
     def _group_submissions_by_key(
         self,

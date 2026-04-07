@@ -6,6 +6,7 @@ Falls back gracefully to application-level blocking when not root.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import subprocess
 import threading
@@ -166,6 +167,20 @@ class IPTablesManager:
         Returns:
             True if blocked successfully, False otherwise.
         """
+        # Never block loopback or private IPs - blocking these breaks
+        # critical system services (DNS resolution, local connectivity).
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.is_loopback or addr.is_private or addr.is_reserved:
+                bt.logging.warning({
+                    "iptables_block_skipped": ip,
+                    "reason": "reserved_or_private_ip",
+                })
+                return False
+        except ValueError:
+            bt.logging.warning({"iptables_block_skipped": ip, "reason": "invalid_ip"})
+            return False
+
         if not self._initialized:
             if not self.initialize():
                 return False

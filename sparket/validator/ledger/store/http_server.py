@@ -166,7 +166,9 @@ class LedgerHTTPServer:
         since = None
         if since_str:
             try:
-                since = datetime.fromisoformat(since_str)
+                # URL query parsers decode '+' as space; restore it so
+                # timezone offsets like '+00:00' parse correctly.
+                since = datetime.fromisoformat(since_str.replace(" ", "+"))
             except ValueError:
                 return web.json_response({"error": "invalid_since"}, status=400)
 

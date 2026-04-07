@@ -27,6 +27,8 @@ from sparket.validator.observability.metrics import (
     ACTIVE_MINERS,
 )
 from sparket.validator.observability.schemas import (
+    ConsensusRow,
+    ConsensusSyncPayload,
     EventSync,
     EventsSyncPayload,
     HeartbeatPayload,
@@ -34,10 +36,15 @@ from sparket.validator.observability.schemas import (
     MinerRosterItem,
     MinerScoreRow,
     OutcomeSync,
+    PricingBookQuote,
+    PricingConsensusRow,
+    PricingSyncPayload,
     RosterSyncPayload,
     ScoredSubmission,
     ScoringHealth,
     ScoresSyncPayload,
+    SubnetPerformanceRow,
+    SubnetPerformanceSyncPayload,
     SubmissionsSyncPayload,
 )
 
@@ -93,6 +100,8 @@ class DataSyncer:
                 self._push_rolling_scores(validator_hotkey),
                 self._push_scored_submissions(validator_hotkey),
                 self._push_events(validator_hotkey),
+                self._push_consensus(validator_hotkey),
+                self._push_pricing(validator_hotkey),
                 return_exceptions=True,
             )
         except Exception as e:
@@ -158,14 +167,37 @@ class DataSyncer:
     # ------------------------------------------------------------------
 
     async def _push_rolling_scores(self, validator_hotkey: str) -> None:
-        rows = await self._db.read(
+        # Use the most recent date that has actual skill scores.
+        # This prevents pushing all-zero data when a new day's pipeline
+        # hasn't completed yet.
+        best_date_rows = await self._db.read(
             text("""
-                SELECT DISTINCT ON (miner_id) *
-                FROM miner_rolling_score
-                ORDER BY miner_id, as_of DESC
+                SELECT as_of FROM miner_rolling_score
+                WHERE skill_score IS NOT NULL AND skill_score > 0
+                ORDER BY as_of DESC LIMIT 1
             """),
             mappings=True,
         )
+        if best_date_rows:
+            best_as_of = best_date_rows[0]["as_of"]
+            rows = await self._db.read(
+                text("""
+                    SELECT * FROM miner_rolling_score
+                    WHERE as_of = :as_of
+                    ORDER BY miner_id
+                """),
+                params={"as_of": best_as_of},
+                mappings=True,
+            )
+        else:
+            rows = await self._db.read(
+                text("""
+                    SELECT DISTINCT ON (miner_id) *
+                    FROM miner_rolling_score
+                    ORDER BY miner_id, as_of DESC
+                """),
+                mappings=True,
+            )
         now = datetime.now(timezone.utc)
         scores = []
         for r in rows:
@@ -174,16 +206,21 @@ class DataSyncer:
                 hotkey=str(r["miner_hotkey"]),
                 as_of=r["as_of"],
                 skill_score=_safe_float(r.get("skill_score")),
-                weight=None,  # filled from weight emission if available
+                weight=_safe_float(r.get("skill_score")),
                 # Legacy dimensions
                 forecast_dim=_safe_float(r.get("forecast_dim")),
                 skill_dim=_safe_float(r.get("skill_dim")),
                 econ_dim=_safe_float(r.get("econ_dim")),
                 info_dim=_safe_float(r.get("info_dim")),
-                # Cobb-Douglas 5-pillar dimensions
-                accuracy_dim=_safe_float(r.get("accuracy_dim")),
-                edge_dim=_safe_float(r.get("edge_dim")),
-                timeliness_dim=_safe_float(r.get("timeliness_dim")),
+                # Cobb-Douglas 5-pillar dimensions (mapped from DB columns)
+                # accuracy = forecast_dim, edge = econ_dim
+                # timeliness = 0.5 * skill_dim + 0.5 * lead_score (not stored directly)
+                accuracy_dim=_safe_float(r.get("forecast_dim")),
+                edge_dim=_safe_float(r.get("econ_dim")),
+                timeliness_dim=(
+                    0.5 * (_safe_float(r.get("skill_dim")) or 0.0)
+                    + 0.5 * (_safe_float(r.get("lead_score")) or 0.0)
+                ) or None,
                 uniqueness_dim=_safe_float(r.get("uniqueness_dim")),
                 marginal_dim=_safe_float(r.get("marginal_dim")),
                 # Anti-sybil
@@ -314,12 +351,26 @@ class DataSyncer:
             text("""
                 SELECT e.event_id, l.code AS league_code, s.code AS sport_code,
                        ht.name AS home_team, at.name AS away_team,
-                       e.venue, e.start_time_utc, e.status
+                       e.venue, e.start_time_utc, e.status,
+                       o.settled_at AS final_at,
+                       COALESCE(sub_counts.n_submissions, 0) AS n_submissions
                 FROM event e
                 JOIN league l ON l.league_id = e.league_id
                 JOIN sport s ON s.sport_id = l.sport_id
                 LEFT JOIN team ht ON ht.team_id = e.home_team_id
                 LEFT JOIN team at ON at.team_id = e.away_team_id
+                LEFT JOIN LATERAL (
+                    SELECT MIN(oo.settled_at) AS settled_at
+                    FROM market mm
+                    JOIN outcome oo ON oo.market_id = mm.market_id
+                    WHERE mm.event_id = e.event_id AND oo.settled_at IS NOT NULL
+                ) o ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*) AS n_submissions
+                    FROM market mm
+                    JOIN miner_submission ms ON ms.market_id = mm.market_id
+                    WHERE mm.event_id = e.event_id
+                ) sub_counts ON TRUE
                 WHERE e.start_time_utc > NOW() - INTERVAL '7 days'
             """),
             mappings=True,
@@ -334,6 +385,8 @@ class DataSyncer:
                 venue=r.get("venue"),
                 start_time_utc=r["start_time_utc"],
                 status=str(r["status"]),
+                final_at=r.get("final_at"),
+                n_submissions=int(r.get("n_submissions", 0)),
             )
             for r in event_rows
         ]
@@ -392,6 +445,245 @@ class DataSyncer:
             outcomes=outcomes,
         )
         await self._push("/api/v1/admin/sync/events", payload, "events")
+
+    # ------------------------------------------------------------------
+    # Consensus timeline
+    # ------------------------------------------------------------------
+
+    async def _push_consensus(self, validator_hotkey: str) -> None:
+        """Push recent consensus timeline snapshots (ground truth) for the line movement chart."""
+        rows = await self._db.read(
+            text("""
+                SELECT
+                    CAST(e.event_id AS TEXT) AS event_id,
+                    gts.snapshot_ts,
+                    -- Pivot market kinds + sides into flat per-event columns
+                    MAX(CASE WHEN mk.kind = 'MONEYLINE' AND gts.side = 'HOME' THEN gts.prob_consensus END) AS ml_home,
+                    MAX(CASE WHEN mk.kind = 'MONEYLINE' AND gts.side = 'AWAY' THEN gts.prob_consensus END) AS ml_away,
+                    MAX(CASE WHEN mk.kind = 'SPREAD' AND gts.side = 'HOME' THEN gts.prob_consensus END) AS sp_home,
+                    MAX(CASE WHEN mk.kind = 'TOTAL' AND gts.side = 'OVER' THEN gts.prob_consensus END) AS total_over
+                FROM ground_truth_snapshot gts
+                JOIN market mk ON mk.market_id = gts.market_id
+                JOIN event e ON e.event_id = mk.event_id
+                WHERE e.start_time_utc > NOW() - INTERVAL '7 days'
+                GROUP BY e.event_id, gts.snapshot_ts
+                ORDER BY gts.snapshot_ts DESC
+                LIMIT 5000
+            """),
+            mappings=True,
+        )
+
+        if not rows:
+            return
+
+        consensus_rows = []
+        for r in rows:
+            consensus_rows.append(
+                ConsensusRow(
+                    event_id=str(r["event_id"]),
+                    timestamp=r["snapshot_ts"],
+                    moneyline_home=_safe_float(r.get("ml_home")) or 0.5,
+                    moneyline_away=_safe_float(r.get("ml_away")) or 0.5,
+                    spread_home=_safe_float(r.get("sp_home")) or 0.5,
+                    total=_safe_float(r.get("total_over")) or 0.5,
+                )
+            )
+
+        payload = ConsensusSyncPayload(
+            validator_hotkey=validator_hotkey,
+            timestamp=datetime.now(timezone.utc),
+            payload=consensus_rows,
+        )
+        await self._push("/api/v1/admin/sync/consensus", payload, "consensus")
+
+    # ------------------------------------------------------------------
+    # Pricing feed
+    # ------------------------------------------------------------------
+
+    async def _push_pricing(self, validator_hotkey: str) -> None:
+        """Push current pricing data for active markets (consensus + per-book quotes)."""
+        # Latest consensus snapshot per market/side for upcoming events
+        consensus_rows = await self._db.read(
+            text("""
+                SELECT DISTINCT ON (gts.market_id, gts.side)
+                    gts.market_id,
+                    mk.event_id,
+                    mk.kind,
+                    mk.line,
+                    gts.side,
+                    gts.prob_consensus,
+                    gts.odds_consensus,
+                    gts.contributing_books,
+                    gts.std_dev,
+                    gts.snapshot_ts
+                FROM ground_truth_snapshot gts
+                JOIN market mk ON mk.market_id = gts.market_id
+                JOIN event e ON e.event_id = mk.event_id
+                WHERE e.status IN ('scheduled', 'in_play')
+                  AND e.start_time_utc > NOW() - INTERVAL '6 hours'
+                ORDER BY gts.market_id, gts.side, gts.snapshot_ts DESC
+            """),
+            mappings=True,
+        )
+
+        consensus = [
+            PricingConsensusRow(
+                market_id=int(r["market_id"]),
+                event_id=int(r["event_id"]),
+                kind=str(r["kind"]),
+                line=_safe_float(r.get("line")),
+                side=str(r["side"]),
+                prob_consensus=float(r["prob_consensus"]),
+                odds_consensus=float(r["odds_consensus"]),
+                contributing_books=int(r["contributing_books"]),
+                std_dev=_safe_float(r.get("std_dev")),
+                snapshot_ts=r["snapshot_ts"],
+            )
+            for r in consensus_rows
+        ]
+
+        if not consensus:
+            return
+
+        # Latest per-book quote for the same markets
+        active_market_ids = list({c.market_id for c in consensus})
+        book_rows = await self._db.read(
+            text("""
+                SELECT DISTINCT ON (pq.provider_id, pq.market_id, pq.side)
+                    pq.market_id,
+                    sb.name AS sportsbook,
+                    pq.side,
+                    pq.odds_eu,
+                    pq.imp_prob,
+                    pq.ts AS fetched_at
+                FROM provider_quote pq
+                JOIN sportsbook sb ON sb.sportsbook_id = pq.provider_id
+                WHERE pq.market_id = ANY(:market_ids)
+                ORDER BY pq.provider_id, pq.market_id, pq.side, pq.ts DESC
+            """),
+            params={"market_ids": active_market_ids},
+            mappings=True,
+        )
+
+        quotes = [
+            PricingBookQuote(
+                market_id=int(r["market_id"]),
+                sportsbook=str(r["sportsbook"]),
+                side=str(r["side"]),
+                odds_eu=float(r["odds_eu"]),
+                imp_prob=float(r["imp_prob"]),
+                fetched_at=r["fetched_at"],
+            )
+            for r in book_rows
+        ]
+
+        payload = PricingSyncPayload(
+            validator_hotkey=validator_hotkey,
+            timestamp=datetime.now(timezone.utc),
+            consensus=consensus,
+            book_quotes=quotes,
+        )
+        await self._push("/api/v1/admin/sync/pricing", payload, "pricing")
+
+    # ------------------------------------------------------------------
+    # Subnet performance aggregates
+    # ------------------------------------------------------------------
+
+    async def _push_subnet_performance(self, validator_hotkey: str) -> None:
+        """Push aggregate subnet performance stats for the public performance page."""
+        # Aggregate performance by sport + market kind, with top-10 cohort.
+        # Uses median CLE and odds-ratio filtering to exclude extreme
+        # longshot submissions that inflate the average (see diagnose_nba_totals).
+        rows = await self._db.read(
+            text("""
+                WITH top10 AS (
+                    SELECT miner_id FROM miner_rolling_score
+                    WHERE as_of = (SELECT MAX(as_of) FROM miner_rolling_score WHERE skill_score > 0)
+                    ORDER BY skill_score DESC LIMIT 10
+                ),
+                scored AS (
+                    SELECT
+                        s.code AS sport_code,
+                        mk.kind AS market_kind,
+                        ms.miner_id,
+                        vc.cle,
+                        os.brier,
+                        os.pss,
+                        -- Odds-ratio eligible: miner_odds within 2x of close
+                        CASE WHEN vc.close_odds_eu > 0
+                                  AND ms.odds_eu / vc.close_odds_eu BETWEEN 0.5 AND 2.0
+                             THEN vc.cle
+                             ELSE NULL
+                        END AS cle_filtered
+                    FROM miner_submission ms
+                    JOIN submission_outcome_score os ON os.submission_id = ms.submission_id
+                    LEFT JOIN submission_vs_close vc ON vc.submission_id = ms.submission_id
+                    JOIN market mk ON mk.market_id = ms.market_id
+                    JOIN event e ON e.event_id = mk.event_id
+                    JOIN league l ON l.league_id = e.league_id
+                    JOIN sport s ON s.sport_id = l.sport_id
+                )
+                SELECT
+                    sport_code,
+                    market_kind,
+                    COUNT(*) AS n_scored,
+                    AVG(cle_filtered) AS avg_cle,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cle_filtered) AS median_cle,
+                    AVG(brier) AS avg_brier,
+                    AVG(pss) AS avg_pss,
+                    AVG(cle_filtered) FILTER (WHERE miner_id IN (SELECT miner_id FROM top10)) AS top10_avg_cle,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cle_filtered)
+                        FILTER (WHERE miner_id IN (SELECT miner_id FROM top10)) AS top10_median_cle,
+                    AVG(brier) FILTER (WHERE miner_id IN (SELECT miner_id FROM top10)) AS top10_avg_brier,
+                    COUNT(*) FILTER (WHERE miner_id IN (SELECT miner_id FROM top10)) AS top10_n_scored
+                FROM scored
+                GROUP BY sport_code, market_kind
+            """),
+            mappings=True,
+        )
+
+        if not rows:
+            return
+
+        perf_rows = [
+            SubnetPerformanceRow(
+                sport_code=str(r["sport_code"]),
+                market_kind=str(r["market_kind"]),
+                n_scored=int(r["n_scored"]),
+                avg_cle=_safe_float(r.get("avg_cle")),
+                median_cle=_safe_float(r.get("median_cle")),
+                avg_brier=_safe_float(r.get("avg_brier")),
+                avg_pss=_safe_float(r.get("avg_pss")),
+                top10_avg_cle=_safe_float(r.get("top10_avg_cle")),
+                top10_median_cle=_safe_float(r.get("top10_median_cle")),
+                top10_avg_brier=_safe_float(r.get("top10_avg_brier")),
+                top10_n_scored=int(r.get("top10_n_scored") or 0),
+            )
+            for r in rows
+        ]
+
+        # Totals
+        total_scored = sum(r.n_scored for r in perf_rows)
+        active_miners = await self._db.read(
+            text("SELECT COUNT(*) AS cnt FROM miner WHERE active = true"),
+            mappings=True,
+        )
+        n_active = int(active_miners[0]["cnt"]) if active_miners else 0
+        total_events_rows = await self._db.read(
+            text("SELECT COUNT(DISTINCT e.event_id) AS cnt FROM event e JOIN market mk ON mk.event_id = e.event_id JOIN outcome o ON o.market_id = mk.market_id WHERE o.settled_at IS NOT NULL"),
+            mappings=True,
+        )
+        n_events = int(total_events_rows[0]["cnt"]) if total_events_rows else 0
+
+        payload = SubnetPerformanceSyncPayload(
+            validator_hotkey=validator_hotkey,
+            timestamp=datetime.now(timezone.utc),
+            total_scored=total_scored,
+            total_events=n_events,
+            active_miners=n_active,
+            rows=perf_rows,
+        )
+        await self._push("/api/v1/admin/sync/subnet-performance", payload, "subnet_performance")
 
     # ------------------------------------------------------------------
     # Heartbeat

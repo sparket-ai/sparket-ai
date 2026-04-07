@@ -675,20 +675,35 @@ class IngestParams(BaseModel):
 
 
 class RetentionParams(BaseModel):
-    """Retention windows in days for cleanup jobs."""
+    """Retention windows in days for cleanup jobs.
 
-    provider_quote_days: int = Field(default=30, ge=1, le=365)
-    provider_closing_days: int = Field(default=30, ge=1, le=365)
-    miner_submission_days: int = Field(default=30, ge=1, le=365)
+    Raw ingestion data (quotes, submissions) is only needed until scoring
+    computes CLE/outcome scores.  Keep them short (14d) to bound DB size.
+    Scored/aggregate data feeds the 30-day rolling window + 60-day
+    calibration window, so those stay longer.
+    """
+
+    # Raw ingestion — safe to trim aggressively once scored
+    provider_quote_days: int = Field(default=14, ge=1, le=365)
+    provider_closing_days: int = Field(default=14, ge=1, le=365)
+    miner_submission_days: int = Field(default=14, ge=1, le=365)
+
+    # Scored per-submission data — feeds 30-day rolling aggregates
     submission_vs_close_days: int = Field(default=30, ge=1, le=365)
-    submission_outcome_score_days: int = Field(default=30, ge=1, le=365)
+
+    # Outcome scores — feeds 60-day calibration window
+    submission_outcome_score_days: int = Field(default=60, ge=1, le=365)
+
+    # Consensus snapshots — keep aligned with rolling window
     ground_truth_snapshot_days: int = Field(default=30, ge=1, le=365)
     ground_truth_closing_days: int = Field(default=30, ge=1, le=365)
-    inbox_processed_days: int = Field(default=7, ge=1, le=365)
-    outbox_sent_days: int = Field(default=7, ge=1, le=365)
-    scoring_job_state_days: int = Field(default=30, ge=1, le=365)
-    scoring_worker_heartbeat_days: int = Field(default=7, ge=1, le=365)
-    scoring_work_queue_days: int = Field(default=7, ge=1, le=365)
+
+    # Operational
+    inbox_processed_days: int = Field(default=3, ge=1, le=365)
+    outbox_sent_days: int = Field(default=3, ge=1, le=365)
+    scoring_job_state_days: int = Field(default=7, ge=1, le=365)
+    scoring_worker_heartbeat_days: int = Field(default=3, ge=1, le=365)
+    scoring_work_queue_days: int = Field(default=3, ge=1, le=365)
 
 
 class WeightEmissionParams(BaseModel):

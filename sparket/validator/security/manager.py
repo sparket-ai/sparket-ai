@@ -227,9 +227,10 @@ class SecurityManager:
         expires_at: Optional[datetime] = None,
     ) -> None:
         """Add an identifier to the blacklist.
-        
+
         Updates both memory cache and database.
-        
+        Protected hotkeys (validators) are never added to the blacklist.
+
         Args:
             identifier: The hotkey or IP to blacklist
             identifier_type: Either "hotkey" or "ip"
@@ -238,9 +239,18 @@ class SecurityManager:
             failure_count: Number of failures
             expires_at: When the ban expires (None for permanent)
         """
+        # Protected hotkeys (validators) can never be banned
+        if identifier_type == "hotkey" and identifier in self.config.protected_hotkeys:
+            bt.logging.info({
+                "security_manager": "ban_blocked_protected_hotkey",
+                "hotkey": identifier,
+                "reason": reason,
+            })
+            return
+
         # Convert expires_at to timestamp for memory storage
         expires_ts = expires_at.timestamp() if expires_at else None
-        
+
         # Update memory immediately
         with self._lock:
             if identifier_type == "hotkey":
@@ -305,14 +315,19 @@ class SecurityManager:
     
     def is_blacklisted(self, hotkey: Optional[str], ip: Optional[str]) -> Tuple[bool, Optional[str]]:
         """Check if hotkey or IP is blacklisted.
-        
+
         Handles both permanent and time-limited bans.
         Expired bans are cleaned up during this check.
-        
+        Protected hotkeys (validators) are never blacklisted.
+
         Returns: (is_blacklisted, reason)
         """
+        # Protected hotkeys (validators) are never blacklisted
+        if hotkey and hotkey in self.config.protected_hotkeys:
+            return False, None
+
         now = time.time()
-        
+
         with self._lock:
             # Check hotkey blacklist
             if hotkey and hotkey in self._blacklist_hotkeys:

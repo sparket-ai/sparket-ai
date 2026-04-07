@@ -35,7 +35,9 @@ async def test_odds_score_skips_low_consensus():
         "imp_prob": 0.5,
         "submitted_at": datetime.now(timezone.utc),
     }
-    assert await handler._score_submission_row(row) is False
+    success, reason = await handler._score_submission_row(row)
+    assert success is False
+    assert reason == "insufficient_books"
     db.write.assert_not_called()
 
 
@@ -58,5 +60,7 @@ async def test_outcome_score_skips_low_consensus():
         "settled_at": datetime.now(timezone.utc),
         "kind": "spread",
     }
-    assert await handler._score_market_submissions(market_row) == 0
+    scored, reason = await handler._score_market_submissions(market_row)
+    assert scored == 0
+    assert reason == "insufficient_books"
     db.write.assert_not_called()

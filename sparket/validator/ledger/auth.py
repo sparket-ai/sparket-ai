@@ -63,7 +63,7 @@ class AccessPolicy:
         metagraph: Any,
         min_stake_threshold: int = 100_000,
         token_ttl: int = 3600,
-        rate_limit_per_hour: int = 60,
+        rate_limit_per_hour: int = 360,
         max_tokens: int = 500,
         max_pending_challenges: int = 1000,
     ):

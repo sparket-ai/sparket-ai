@@ -135,11 +135,25 @@ class MainScoreHandler:
                 RollingAggregatesJob,
                 CalibrationSharpnessJob,
                 OriginalityLeadLagJob,
-                SkillScoreJob,
+                SkillScoreJob,  # terminal job — depends on all upstream jobs
             ]
-            
+
+            failed_jobs: list[str] = []
             for job_class in job_classes:
                 job_name = job_class.__name__
+
+                # Terminal job must not run on stale data (CLAUDE.md rule #3)
+                if job_class is job_classes[-1] and failed_jobs:
+                    results["jobs_failed"] += 1
+                    skip_reason = f"skipped due to upstream failures: {failed_jobs}"
+                    results["errors"].append(f"{job_name}: {skip_reason}")
+                    bt.logging.warning({
+                        "main_score_job": job_name,
+                        "status": "skipped",
+                        "reason": skip_reason,
+                    })
+                    continue
+
                 try:
                     job = job_class(self.database, self._logger)
                     with SCORING_JOB_DURATION.labels(job=job_name).time():
@@ -148,6 +162,7 @@ class MainScoreHandler:
                     bt.logging.info({"main_score_job": job_name, "status": "completed"})
                 except Exception as e:
                     results["jobs_failed"] += 1
+                    failed_jobs.append(job_name)
                     results["errors"].append(f"{job_name}: {e}")
                     bt.logging.warning({
                         "main_score_job": job_name,
@@ -289,8 +304,14 @@ class MainScoreHandler:
             }
         })
 
-    async def run_snapshots(self) -> dict:
-        """Run only the ground truth snapshot pipeline."""
+    async def run_snapshots(self, validator: Optional[Any] = None) -> dict:
+        """Run only the ground truth snapshot pipeline and batch scoring.
+
+        In worker mode the heavy aggregation jobs run as worker tasks,
+        but the snapshot pipeline and batch CLV/outcome scoring still
+        need to run in the main validator loop so that input data is
+        kept fresh for the worker jobs.
+        """
         bt.logging.info({"main_score_snapshots": "start"})
         results = {"snapshots": 0, "closing_snapshots": 0, "late_closing": 0, "ground_truth": 0, "errors": []}
         try:
@@ -315,6 +336,50 @@ class MainScoreHandler:
         except Exception as e:
             bt.logging.warning({"main_score_snapshots_error": str(e)})
             results["errors"].append(str(e))
+
+        # Export ledger checkpoint for auditors (runs first — fast, must not be
+        # blocked by slow batch scoring)
+        try:
+            ledger_enabled = bool(os.environ.get("SPARKET_LEDGER__ENABLED", "").lower() in ("true", "1", "yes"))
+            if ledger_enabled and validator is not None:
+                await self._export_ledger(
+                    validator,
+                    export_checkpoint=True,
+                    export_delta=False,
+                )
+                results["ledger_checkpoint"] = True
+                bt.logging.info({"run_snapshots_checkpoint": "exported"})
+        except Exception as e:
+            bt.logging.warning({"main_score_ledger_error": repr(e)})
+
+        # Batch score unscored outcomes
+        try:
+            since = datetime.now(timezone.utc) - timedelta(days=7)
+
+            outcome_handler = OutcomeScoreHandler(self.database)
+            outcome_scored = await outcome_handler.score_batch(since=since, limit=500)
+            results["outcome_scored"] = outcome_scored
+            results["clv_scored"] = 0
+
+            bt.logging.info({
+                "main_score_batch": {
+                    "clv_scored": 0,
+                    "outcome_scored": outcome_scored,
+                }
+            })
+
+            # Export delta if new outcomes were scored
+            if outcome_scored > 0 and ledger_enabled and validator is not None:
+                await self._export_ledger(
+                    validator,
+                    export_checkpoint=False,
+                    export_delta=True,
+                )
+                results["ledger_delta"] = True
+        except Exception as e:
+            bt.logging.warning({"main_score_batch_error": repr(e)})
+            results["errors"].append(f"batch_scoring: {e}")
+
         return results
 
 
@@ -353,22 +418,24 @@ async def run_main_scoring_if_due_async(
         pass
 
 
-async def run_snapshot_pipeline_if_due_async(*, step: int, app_config: Any, handlers: Any) -> None:
+async def run_snapshot_pipeline_if_due_async(*, step: int, app_config: Any, handlers: Any, validator: Any = None) -> None:
     """
-    Step-based scheduler for ground truth snapshots only.
+    Step-based scheduler for ground truth snapshots, batch scoring, and ledger export.
     Uses the same interval as main scoring to keep cadence aligned.
     """
     try:
-        steps_interval = 25
+        steps_interval = 5
         try:
-            steps_interval = int(getattr(getattr(app_config, "core", None), "timers", None).main_score_steps)  # type: ignore[attr-defined]
+            cfg_val = int(getattr(getattr(app_config, "core", None), "timers", None).main_score_steps)  # type: ignore[attr-defined]
+            # Use 1/5 of the main score interval for batch scoring, minimum 5
+            steps_interval = max(5, cfg_val // 5)
         except Exception:
             pass
         if steps_interval > 0 and (step % steps_interval == 0):
             try:
-                await handlers.main_score_handler.run_snapshots()
+                await handlers.main_score_handler.run_snapshots(validator=validator)
             except Exception as e:
-                bt.logging.warning({"main_score_snapshots_error": str(e)})
+                bt.logging.warning({"main_score_snapshots_error": repr(e)})
     except Exception:
         # fail-closed without affecting the main loop
         pass

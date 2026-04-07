@@ -165,13 +165,21 @@ _UPSERT_GROUND_TRUTH_CLOSING = text("""
         contributing_books, min_prob, max_prob, std_dev,
         bias_version, computed_at
     )
-    SELECT 
+    SELECT DISTINCT ON (gs.market_id, gs.side)
         gs.market_id, gs.side, gs.prob_consensus, gs.odds_consensus,
         gs.contributing_books, NULL, NULL, gs.std_dev,
         gs.bias_version, gs.snapshot_ts
     FROM ground_truth_snapshot gs
+    JOIN market m ON gs.market_id = m.market_id
     WHERE gs.market_id = :market_id
       AND gs.is_closing = true
+      AND (
+          (m.kind = 'MONEYLINE' AND gs.side::text IN ('HOME', 'AWAY', 'DRAW'))
+          OR (m.kind = 'SPREAD' AND gs.side::text IN ('HOME', 'AWAY'))
+          OR (m.kind = 'TOTAL' AND gs.side::text IN ('OVER', 'UNDER'))
+          OR (m.kind = 'DRAW_NO_BET' AND gs.side::text IN ('HOME', 'AWAY'))
+      )
+    ORDER BY gs.market_id, gs.side, gs.snapshot_ts DESC
     ON CONFLICT (market_id, side) DO UPDATE SET
         prob_consensus = EXCLUDED.prob_consensus,
         odds_consensus = EXCLUDED.odds_consensus,

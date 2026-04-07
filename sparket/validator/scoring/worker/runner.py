@@ -46,6 +46,8 @@ WORK_TYPE_ORDER = (
     WorkType.ROLLING,
     WorkType.CALIBRATION,
     WorkType.ORIGINALITY,
+    WorkType.COMPOSITE_UNIQUENESS,
+    WorkType.SHAPLEY,
     WorkType.SKILL,
 )
 
@@ -114,14 +116,13 @@ class ScoringWorkerRunner:
             asyncio.set_event_loop(loop)
 
             try:
-                # Create independent database connection
-                self._init_database()
-
                 # Record startup memory baseline
                 self._startup_memory_mb = self._get_memory_mb()
                 logger.info(f"Startup memory: {self._startup_memory_mb} MB")
 
                 # Run startup tasks in the same loop
+                # DB init happens inside _startup_tasks to ensure
+                # connections are created within this event loop
                 loop.run_until_complete(self._startup_tasks())
 
                 # Main loop
@@ -143,6 +144,10 @@ class ScoringWorkerRunner:
 
     async def _startup_tasks(self) -> None:
         """Run startup tasks."""
+        # Init DB inside the event loop to ensure connections are
+        # created in this loop context (fork-safe)
+        self._init_database()
+
         # Register worker
         await self._register_worker()
         
