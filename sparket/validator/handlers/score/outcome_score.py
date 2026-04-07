@@ -86,7 +86,7 @@ _SELECT_SETTLED_MARKETS = text(
           SELECT 1 FROM ground_truth_closing gtc
           WHERE gtc.market_id = o.market_id
       )
-    ORDER BY o.settled_at DESC
+    ORDER BY o.settled_at ASC
     LIMIT :limit
     """
 )
@@ -439,12 +439,31 @@ class OutcomeScoreHandler:
         if not valid_sides:
             return None
 
-        # Three-way or more: require full coverage
+        # Three-way or more
         if len(valid_sides) >= 3:
-            if any(side not in sides_data for side in valid_sides):
-                return None
-            probs = [sides_data[side] for side in valid_sides]
-            return self._normalize_probs(probs)
+            provided = [side for side in valid_sides if side in sides_data]
+            missing = [side for side in valid_sides if side not in sides_data]
+
+            if len(missing) == 0:
+                # Full coverage
+                probs = [sides_data[side] for side in valid_sides]
+                return self._normalize_probs(probs)
+
+            if len(missing) == 1:
+                # Infer missing side as complement (e.g. soccer moneyline:
+                # miners submit HOME+AWAY, DRAW = 1 - HOME - AWAY)
+                provided_sum = sum(sides_data[s] for s in provided)
+                complement = Decimal("1") - provided_sum
+                if complement <= Decimal("0") or complement >= Decimal("1"):
+                    return None
+                probs = [
+                    sides_data[s] if s in sides_data else complement
+                    for s in valid_sides
+                ]
+                return self._normalize_probs(probs)
+
+            # Too many missing sides
+            return None
 
         # Two-way: allow complement when only one side submitted
         if len(valid_sides) == 2:

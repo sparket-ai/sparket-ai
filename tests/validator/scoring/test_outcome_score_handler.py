@@ -42,7 +42,7 @@ async def test_moneyline_partial_submission_skipped():
     db = _make_db([gt_probs, submissions])
     handler = OutcomeScoreHandler(db)
 
-    scored = await handler._score_market_submissions(market_row)
+    scored, reason = await handler._score_market_submissions(market_row)
 
     assert scored == 0
     db.write.assert_not_called()
@@ -75,7 +75,7 @@ async def test_two_way_single_side_uses_complement():
     db = _make_db([gt_probs, submissions])
     handler = OutcomeScoreHandler(db)
 
-    scored = await handler._score_market_submissions(market_row)
+    scored, reason = await handler._score_market_submissions(market_row)
 
     assert scored == 1
     db.write.assert_called_once()
@@ -130,7 +130,7 @@ async def test_moneyline_full_vector_scores_all_sides():
     db = _make_db([gt_probs, submissions])
     handler = OutcomeScoreHandler(db)
 
-    scored = await handler._score_market_submissions(market_row)
+    scored, reason = await handler._score_market_submissions(market_row)
 
     assert scored == 3
     assert db.write.call_count == 3
