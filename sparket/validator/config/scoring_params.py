@@ -677,16 +677,18 @@ class IngestParams(BaseModel):
 class RetentionParams(BaseModel):
     """Retention windows in days for cleanup jobs.
 
-    Raw ingestion data (quotes, submissions) is only needed until scoring
-    computes CLE/outcome scores.  Keep them short (14d) to bound DB size.
-    Scored/aggregate data feeds the 30-day rolling window + 60-day
-    calibration window, so those stay longer.
+    miner_submission must be >= rolling_window_days (30) because
+    RollingAggregatesJob joins miner_submission with outcome scores
+    over the full rolling window.  Provider quotes/closings are safe
+    to trim after scoring computes CLE.
     """
 
-    # Raw ingestion — safe to trim aggressively once scored
+    # Provider data — safe to trim once CLE is computed
     provider_quote_days: int = Field(default=14, ge=1, le=365)
     provider_closing_days: int = Field(default=14, ge=1, le=365)
-    miner_submission_days: int = Field(default=14, ge=1, le=365)
+
+    # Must be >= rolling_window_days (30d) — rolling agg queries this table
+    miner_submission_days: int = Field(default=35, ge=1, le=365)
 
     # Scored per-submission data — feeds 30-day rolling aggregates
     submission_vs_close_days: int = Field(default=30, ge=1, le=365)
