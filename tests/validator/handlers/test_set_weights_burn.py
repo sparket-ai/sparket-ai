@@ -188,33 +188,28 @@ class TestEmitWeightsWithBurn:
 
     @patch.object(SetWeightsHandler, '_get_burn_uid')
     @patch.object(SetWeightsHandler, '_apply_burn_rate')
-    def test_with_scores_applies_configured_burn_rate(
+    def test_with_scores_skips_burn_when_rate_zero(
         self, mock_apply_burn, mock_get_burn_uid
     ):
-        """With valid scores, should apply configured burn rate."""
+        """With burn_rate=0.0 (v0.1.2 default), should NOT apply burn rate."""
         mock_get_burn_uid.return_value = 0
-        mock_apply_burn.return_value = np.array([0.9, 0.05, 0.03, 0.02], dtype=np.float32)
 
         scores = np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float32)
 
         with patch(
             'sparket.validator.handlers.core.weights.set_weights.process_weights_for_netuid'
         ) as mock_process:
-            mock_process.return_value = (self.validator.metagraph.uids, np.array([0.9, 0.05, 0.03, 0.02]))
+            mock_process.return_value = (self.validator.metagraph.uids, np.array([0.4, 0.3, 0.2, 0.1]))
             with patch(
                 'sparket.validator.handlers.core.weights.set_weights.convert_weights_and_uids_for_emit'
             ) as mock_convert:
-                mock_convert.return_value = (np.array([0, 1, 2, 3]), np.array([58981, 3276, 1966, 1310]))
+                mock_convert.return_value = (np.array([0, 1, 2, 3]), np.array([26213, 19660, 13106, 6553]))
                 self.validator.subtensor.set_weights.return_value = (True, "ok")
 
                 self.handler._emit_weights(self.validator, scores)
 
-                # Verify _apply_burn_rate was called with correct args
-                mock_apply_burn.assert_called_once()
-                call_args = mock_apply_burn.call_args
-                # Args are positional: (raw_weights, burn_uid, burn_rate)
-                assert call_args[0][1] == 0  # burn_uid
-                assert np.isclose(call_args[0][2], 0.9)  # burn_rate
+                # burn_rate=0.0 → _apply_burn_rate should NOT be called
+                mock_apply_burn.assert_not_called()
 
 
 class TestEmitWeightsIntegration:
@@ -230,8 +225,8 @@ class TestEmitWeightsIntegration:
         self.validator.metagraph.uids = np.arange(256)
         self.validator.metagraph.hotkeys = [f"hk{i}" for i in range(256)]
 
-    def test_full_flow_with_burn(self):
-        """Full integration test: scores -> normalized -> burn applied -> emitted."""
+    def test_full_flow_no_burn(self):
+        """Full integration test: scores -> normalized -> no burn (burn_rate=0.0)."""
         # Set up burn hotkey at UID 0
         burn_hotkey = "burn_hk"
         self.validator.metagraph.hotkeys[0] = burn_hotkey
@@ -263,14 +258,12 @@ class TestEmitWeightsIntegration:
 
                 self.handler._emit_weights(self.validator, scores)
 
-        # Verify burn UID got 90%
-        assert np.isclose(captured_weights['raw'][0], 0.9)
+        # burn_rate=0.0: burn UID should get 0%, miners keep full share
+        assert np.isclose(captured_weights['raw'][0], 0.0)
 
-        # Verify miners got their proportional share of remaining 10%
-        # Original: [0.5, 0.3, 0.1, 0.07, 0.03] (sum=1.0)
-        # After 90% burn: [0.05, 0.03, 0.01, 0.007, 0.003]
-        assert np.isclose(captured_weights['raw'][1], 0.05, atol=1e-6)
-        assert np.isclose(captured_weights['raw'][2], 0.03, atol=1e-6)
+        # Miners get their full normalized proportional share
+        assert np.isclose(captured_weights['raw'][1], 0.5, atol=1e-6)
+        assert np.isclose(captured_weights['raw'][2], 0.3, atol=1e-6)
 
         # Total should still be 1.0
         assert np.isclose(np.sum(captured_weights['raw']), 1.0)

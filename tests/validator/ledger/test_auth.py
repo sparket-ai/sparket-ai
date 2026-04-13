@@ -29,7 +29,7 @@ def metagraph():
 
 @pytest.fixture
 def policy(metagraph):
-    return AccessPolicy(metagraph=metagraph, min_stake_threshold=100_000)
+    return AccessPolicy(metagraph=metagraph, min_stake_threshold=100_000, rate_limit_per_hour=60)
 
 
 class TestAccessPolicy:

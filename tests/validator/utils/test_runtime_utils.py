@@ -14,8 +14,8 @@ def test_next_backoff_delay_handles_non_positive():
 def test_resolve_loop_timeouts():
     timeouts = resolve_loop_timeouts(12)
     assert timeouts["forward"] == 12
-    assert timeouts["scoring"] == 24
-    assert timeouts["provider"] == 24
-    assert timeouts["cleanup"] == 24
-    assert timeouts["outcome"] == 24
-    assert timeouts["worker_heartbeat"] == 12
+    assert timeouts["scoring"] == 300           # max(300, 24)
+    assert timeouts["provider"] == 120          # max(120, 24)
+    assert timeouts["cleanup"] == 60            # max(60, 24)
+    assert timeouts["outcome"] == 120           # max(120, 24)
+    assert timeouts["worker_heartbeat"] == 12   # max(10, 12)
