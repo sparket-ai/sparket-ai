@@ -355,4 +355,4 @@ def config(cls):
                 })
     except Exception:
         pass
-    return bt.config(parser)
+    return bt.Config(parser)

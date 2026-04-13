@@ -17,8 +17,8 @@ class TestConfiguration:
     """Tests for configuration."""
     
     def test_default_config_has_miners(self):
-        """Default config should have 3 miners."""
-        assert len(DEFAULT_CONFIG.miners) == 3
+        """Default config should have 2 miners."""
+        assert len(DEFAULT_CONFIG.miners) == 2
     
     def test_miner_uids_assigned(self):
         """All miners should have UIDs."""
@@ -59,22 +59,20 @@ class TestMinerPool:
     """Tests for miner pool."""
     
     def test_pool_has_correct_size(self, harness: LocalnetHarness):
-        """Pool should have 3 miners."""
-        assert len(harness.miners) == 3
-    
+        """Pool should have 2 miners."""
+        assert len(harness.miners) == 2
+
     def test_miners_have_wallet_names(self, harness: LocalnetHarness):
         """Each miner should have a wallet name."""
-        expected_names = {"local-miner", "e2e-miner-2", "e2e-miner-3"}
+        expected_names = {"e2e-miner-2", "e2e-miner-3"}
         actual_names = {m.wallet_name for m in harness.miners}
         assert actual_names == expected_names
-    
+
     @pytest.mark.asyncio
     async def test_miner_health_check(self, harness: LocalnetHarness):
         """Should be able to check miner health."""
-        # May fail if miners not running - documents what we check
         health = await harness.miners.health_check_all()
-        # Just verify we got results for all miners
-        assert len(health) == 3
+        assert len(health) == 2
 
 
 class TestDatabaseConnection:
@@ -114,4 +112,4 @@ class TestHarnessLifecycle:
         # Should have entries for validator, miners, database
         assert "validator" in health
         assert "database" in health
-        assert len(health) >= 5  # validator + 3 miners + database
+        assert len(health) >= 4  # validator + 2 miners + database
