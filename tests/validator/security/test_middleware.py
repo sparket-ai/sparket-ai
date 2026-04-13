@@ -166,34 +166,27 @@ class TestSecurityMiddleware:
         ip = middleware._get_client_ip(request)
         assert ip == "192.168.1.100"
 
-    def test_get_client_ip_from_x_forwarded_for(self):
-        """Test extracting IP from X-Forwarded-For header."""
-        manager = SecurityManager()
-        app = MagicMock()
-        middleware = SecurityMiddleware(app, manager)
-        
-        request = MagicMock()
-        request.headers = {"x-forwarded-for": "10.0.0.1, 192.168.1.1"}
-        request.client = MagicMock()
-        request.client.host = "127.0.0.1"
-        
-        ip = middleware._get_client_ip(request)
-        # Should get first IP in chain
-        assert ip == "10.0.0.1"
+    def test_get_client_ip_ignores_proxy_headers(self):
+        """Proxy headers are ignored — no reverse proxy in front of this service.
 
-    def test_get_client_ip_from_x_real_ip(self):
-        """Test extracting IP from X-Real-IP header."""
+        An attacker could spoof X-Forwarded-For / X-Real-IP to trick the
+        rate limiter into blocking arbitrary IPs (including 127.0.0.1).
+        """
         manager = SecurityManager()
         app = MagicMock()
         middleware = SecurityMiddleware(app, manager)
-        
+
         request = MagicMock()
-        request.headers = {"x-real-ip": "10.0.0.5"}
+        request.headers = {
+            "x-forwarded-for": "10.0.0.1, 192.168.1.1",
+            "x-real-ip": "10.0.0.5",
+        }
         request.client = MagicMock()
-        request.client.host = "127.0.0.1"
-        
+        request.client.host = "203.0.113.42"
+
         ip = middleware._get_client_ip(request)
-        assert ip == "10.0.0.5"
+        # Must use TCP peer address, not spoofable headers
+        assert ip == "203.0.113.42"
 
     def test_is_synapse_endpoint(self):
         """Test synapse endpoint detection."""

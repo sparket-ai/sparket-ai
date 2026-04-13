@@ -71,21 +71,17 @@ if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     # print current working directory
     bt.logging.info({"current_working_directory": os.getcwd()})
-    # check and log if .env file exists/is readable
-    if not os.path.exists(".env"):
-        bt.logging.error("Error: .env file not found")
-        exit(1)
-    if not os.access(".env", os.R_OK):
-        bt.logging.error("Error: .env file is not readable")
-        exit(1)
-    bt.logging.info({"env_file_exists": os.path.exists(".env")})
-    bt.logging.info({"env_file_readable": os.access(".env", os.R_OK)})
-
-    # In test mode, PM2 sets env vars directly - don't override from .env
+    # In test mode, PM2 sets env vars directly - don't need .env
     test_mode = os.getenv("SPARKET_TEST_MODE", "").lower() in ("true", "1", "yes")
     if test_mode:
         bt.logging.info({"env_file_loaded": False, "reason": "test_mode_active"})
     else:
+        if not os.path.exists(".env"):
+            bt.logging.error("Error: .env file not found")
+            exit(1)
+        if not os.access(".env", os.R_OK):
+            bt.logging.error("Error: .env file is not readable")
+            exit(1)
         bt.logging.info({"env_file_loaded": load_dotenv(".env", verbose=True, override=True)})
 
     # Compose database URL from env vars if missing or port changed

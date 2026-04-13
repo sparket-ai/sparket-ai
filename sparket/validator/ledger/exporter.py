@@ -247,13 +247,9 @@ class LedgerExporter:
                 hotkey=row["hotkey"],
                 uid=row["uid"],
                 n_submissions=int(row.get("n_submissions") or 0),
-                # For miners with no outcome data (brier_wt=0), encode the
-                # default as ws=0.5, wt=1.0 so that derive_means() on both
-                # old and new auditor code computes 0.5 (hits the Brier floor)
-                # instead of 0.0 (incorrectly passes it).
                 brier=MetricAccumulator(
-                    ws=_safe_float(row.get("brier_ws")) if _safe_float(row.get("brier_wt")) else 0.5,
-                    wt=_safe_float(row.get("brier_wt")) if _safe_float(row.get("brier_wt")) else 1.0,
+                    ws=_safe_float(row.get("brier_ws")),
+                    wt=_safe_float(row.get("brier_wt")),
                 ),
                 fq=MetricAccumulator(
                     ws=_safe_float(row.get("fq_ws")),

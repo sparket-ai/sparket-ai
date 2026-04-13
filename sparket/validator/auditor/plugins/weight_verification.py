@@ -12,6 +12,7 @@ from typing import Any
 
 import bittensor as bt
 
+from sparket import __spec_version__
 from sparket.validator.auditor.attestation import create_attestation
 from sparket.validator.auditor.plugin_registry import AuditorContext, TaskResult
 from sparket.validator.ledger.compute_weights import compute_weights
@@ -140,18 +141,15 @@ class WeightVerificationHandler:
                 subtensor = context.subtensor
                 netuid = context.config.get("netuid", 57)
 
-                response = subtensor.set_weights(
+                result_ok, msg = subtensor.set_weights(
                     wallet=wallet,
                     netuid=netuid,
                     uids=weight_result.uids,
                     weights=weight_result.uint16_weights,
                     wait_for_finalization=False,
                     wait_for_inclusion=False,
+                    version_key=__spec_version__,
                 )
-
-                # bt v10 returns ExtrinsicResponse with .success and .message
-                result_ok = getattr(response, "success", bool(response))
-                msg = getattr(response, "message", str(response))
 
                 evidence["set_weights"] = "success" if result_ok else f"failed: {msg}"
                 bt.logging.info({

@@ -55,25 +55,22 @@ class LocalnetConfig:
     database_password: str = "sparket"
     
     # Validator
-    validator: ValidatorConfig = field(default_factory=ValidatorConfig)
-    
+    validator: ValidatorConfig = field(default_factory=lambda: ValidatorConfig(
+        wallet_name="e2e-validator",
+        uid=4,
+    ))
+
     # Miners (registered on localnet)
     miners: List[MinerConfig] = field(default_factory=lambda: [
         MinerConfig(
-            wallet_name="local-miner",
-            uid=2,
-            axon_port=8094,
-            control_port=8198,
-        ),
-        MinerConfig(
             wallet_name="e2e-miner-2",
-            uid=4,
+            uid=2,
             axon_port=8095,
             control_port=8197,
         ),
         MinerConfig(
             wallet_name="e2e-miner-3",
-            uid=5,
+            uid=3,
             axon_port=8096,
             control_port=8196,
         ),

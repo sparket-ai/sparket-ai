@@ -155,7 +155,7 @@ class SkillScoreJob(ScoringJob):
                 sharp_score=self._to_float_safe(row.get("sharp_score"), 0.5),
                 sos_score=self._to_float_safe(row["sos_score"], 0.5),
                 lead_score=self._to_float_safe(row["lead_score"], 0.5),
-                brier_mean=self._to_float_safe(row.get("brier_mean"), 0.0),
+                brier_mean=self._to_float_safe(row.get("brier_mean"), 0.5),
                 uniqueness_dim=self._to_float_or_none(row.get("uniqueness_dim")),
                 marginal_dim=self._to_float_or_none(row.get("marginal_dim")),
             ))

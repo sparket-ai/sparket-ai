@@ -277,7 +277,7 @@ class TestOddsRatioGating:
                 make_submission(1, now - timedelta(days=1), cle=0.05, miner_odds=2.1, close_odds=2.0),
                 # Extreme: odds ratio 5.3/1.9 = 2.79 → excluded
                 make_submission(2, now - timedelta(days=1), cle=1.0, miner_odds=5.3, close_odds=1.9),
-                # Extreme: odds ratio 4.0/2.0 = 2.0 → borderline, excluded (> not >=)
+                # Extreme: odds ratio 4.1/2.0 = 2.05 → excluded
                 make_submission(3, now - timedelta(days=1), cle=0.9, miner_odds=4.1, close_odds=2.0),
             ]
         )

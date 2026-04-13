@@ -206,14 +206,9 @@ def compute_weights(
     info_dim = w_sos * sos_norm + w_lead * lead_norm        # → Timeliness pillar
 
     # Map to Cobb-Douglas 5-pillar names
-    # Accuracy = forecast_dim (Brier + calibration)
-    # Edge = econ_dim (CLE + market efficiency)
-    # Timeliness = info_dim (lead-lag component) blended with skill_dim
     accuracy_dim = forecast_dim
     edge_dim_arr = econ_dim
-    timeliness_dim = w_sos * sos_norm * 0 + w_lead * lead_norm  # lead component only
-    # Actually, keep timeliness as the lead-lag + skill blend for backward compat
-    timeliness_dim = 0.5 * skill_dim + 0.5 * (lead_norm)
+    timeliness_dim = 0.5 * skill_dim + 0.5 * lead_norm
 
     # Uniqueness and Marginal from new Cobb-Douglas dimensions
     uniqueness_arr = np.array(

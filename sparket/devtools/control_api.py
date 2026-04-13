@@ -767,9 +767,15 @@ class TestControlAPI:
                 return web.json_response({"status": "error", "message": "No node"}, status=500)
             
             if hasattr(self.node, "validator_client"):
+                # Use token from request, or auto-attach from stored validator endpoint
+                token = data.get("token")
+                if not token:
+                    endpoint = getattr(self.node, "validator_endpoint", None) or {}
+                    if isinstance(endpoint, dict):
+                        token = endpoint.get("token")
                 payload = {
                     "submissions": data.get("submissions", []),
-                    "token": data.get("token"),
+                    "token": token,
                 }
                 success = await self.node.validator_client.submit_odds(payload)
                 return web.json_response({

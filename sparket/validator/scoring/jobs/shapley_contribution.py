@@ -61,11 +61,19 @@ _SELECT_MARKET_SUBMISSIONS = text(
 
 _SELECT_MARKET_OUTCOMES = text(
     """
-    SELECT side, result
-    FROM outcome
-    WHERE market_id = :market_id
+    SELECT o.result, m.kind
+    FROM outcome o
+    JOIN market m ON o.market_id = m.market_id
+    WHERE o.market_id = :market_id
     """
 )
+
+_VALID_SIDES_BY_KIND: Dict[str, List[str]] = {
+    "MONEYLINE": ["AWAY", "DRAW", "HOME"],
+    "SPREAD": ["AWAY", "HOME"],
+    "TOTAL": ["OVER", "UNDER"],
+    "DRAW_NO_BET": ["AWAY", "HOME"],
+}
 
 _SELECT_PREVIOUS_WEIGHTS = text(
     """
@@ -224,8 +232,11 @@ class ShapleyContributionJob(ScoringJob):
                 mappings=True,
             )
             outcome_map: Dict[str, int] = {}
-            for row in outcomes:
-                outcome_map[row["side"]] = int(row["result"])
+            if outcomes:
+                result = str(outcomes[0]["result"])
+                kind = str(outcomes[0]["kind"])
+                for side in _VALID_SIDES_BY_KIND.get(kind, []):
+                    outcome_map[side] = 1 if side == result else 0
 
             if not outcome_map:
                 continue

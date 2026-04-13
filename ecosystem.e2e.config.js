@@ -51,22 +51,16 @@ const baseEnv = {
 
 // Miner configurations
 const miners = [
-  { 
-    name: 'e2e-miner-1', 
-    wallet: 'local-miner', 
-    axonPort: 8094, 
-    controlPort: 8198,
-  },
-  { 
-    name: 'e2e-miner-2', 
-    wallet: 'e2e-miner-2', 
-    axonPort: 8095, 
+  {
+    name: 'e2e-miner-2',
+    wallet: 'e2e-miner-2',
+    axonPort: 8095,
     controlPort: 8197,
   },
-  { 
-    name: 'e2e-miner-3', 
-    wallet: 'e2e-miner-3', 
-    axonPort: 8096, 
+  {
+    name: 'e2e-miner-3',
+    wallet: 'e2e-miner-3',
+    axonPort: 8096,
     controlPort: 8196,
   },
 ];
@@ -87,7 +81,7 @@ module.exports = {
       env: {
         ...baseEnv,
         SPARKET_ROLE: 'validator',
-        SPARKET_WALLET__NAME: 'local-validator',
+        SPARKET_WALLET__NAME: 'e2e-validator',
         SPARKET_WALLET__HOTKEY: 'default',
         SPARKET_AXON__HOST: '0.0.0.0',
         SPARKET_AXON__PORT: '8093',
@@ -200,7 +194,7 @@ module.exports = {
         SPARKET_ROLE: 'auditor',
         SPARKET_WALLET__NAME: 'e2e-miner-3',
         SPARKET_WALLET__HOTKEY: 'default',
-        SPARKET_AUDITOR__PRIMARY_HOTKEY: '5HKjkxQxGrVZDHZKVHRQua1nTnvHgEz8mX67wqVzgNU6a3EK',
+        SPARKET_AUDITOR__PRIMARY_HOTKEY: '5GVmJzyrpTNd2Awpymx3Aai3wJ1PnrEfMBWJnVvfAQDkET65',
         SPARKET_AUDITOR__PRIMARY_URL: 'http://127.0.0.1:8200',
         SPARKET_AUDITOR__POLL_INTERVAL_SECONDS: '30',
         SPARKET_AUDITOR__WEIGHT_TOLERANCE: '0.01',
