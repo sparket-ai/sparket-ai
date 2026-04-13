@@ -86,7 +86,7 @@ class TestAccumulatorEntry:
             brier=MetricAccumulator(ws=float('nan'), wt=0.0),
         )
         acc.derive_means()
-        assert acc.brier_mean == 0.0  # wt=0 -> fallback
+        assert acc.brier_mean == 0.5  # wt=0 -> fallback (0.5 = unknown accuracy)
 
     def test_derived_means_match_ws_wt(self):
         acc = AccumulatorEntry(
@@ -119,7 +119,7 @@ class TestAccumulatorEntry:
             lead=MetricAccumulator(ws=0, wt=0),
         )
         acc.derive_means()
-        assert acc.brier_mean == 0.0
+        assert acc.brier_mean == 0.5  # default: unknown accuracy
         assert acc.fq_raw == 0.0
         assert acc.pss_mean == 0.0
         assert acc.mes_mean == 0.5  # default for mes
