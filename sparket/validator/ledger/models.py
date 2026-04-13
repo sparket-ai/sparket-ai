@@ -109,7 +109,7 @@ class AccumulatorEntry(BaseModel):
     lead: MetricAccumulator = Field(default_factory=lambda: MetricAccumulator(ws=0, wt=0))
 
     # Derived means (convenience, auditors verify these match ws/wt)
-    brier_mean: float = 0.0
+    brier_mean: float = 0.5
     fq_raw: float = 0.0
     pss_mean: float = 0.0
     es_adj: float = 0.0
@@ -237,7 +237,7 @@ class MinerMetrics(BaseModel):
     sharp_score: float = 0.5
     sos_score: float = 0.5
     lead_score: float = 0.5
-    brier_mean: float = 0.0
+    brier_mean: float = 0.5
     # Cobb-Douglas new dimensions (None = not yet computed, use bootstrap defaults)
     uniqueness_dim: float | None = None
     marginal_dim: float | None = None
