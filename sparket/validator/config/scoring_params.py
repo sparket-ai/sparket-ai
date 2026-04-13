@@ -716,7 +716,7 @@ class WeightEmissionParams(BaseModel):
     """
 
     burn_rate: Decimal = Field(
-        default=Decimal("0.9"),
+        default=Decimal("0.0"),
         ge=Decimal("0"),
         le=Decimal("1"),
         description=(
